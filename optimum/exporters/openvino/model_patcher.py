@@ -8850,15 +8850,29 @@ def qwen3_5_moe_gated_delta_net_forward(
 
 
 # ------------------------------------------------------------------------------
-# Vectorized SparseMoeBlock forward for Qwen3_5Moe
+# Gather-based SparseMoeBlock forward for Qwen3_5Moe
 #
-# Replaces the dynamic loop in Qwen3_5MoeExperts.forward with batched matmul,
-# which is fully traceable and benefits from OV MoE optimizations.
+# Uses gather-based computation (only process top_k expert assignments per token)
+# instead of dense expansion over all experts.
+#
+# Motivation:
+#   The dense approach (`expand([E, T, H])` + 3D BMM) forces OV/oneDNN to
+#   dequantize ALL E=256 expert weight matrices simultaneously (gate_up_proj
+#   [256, 1024, 2048] + down_proj [256, 2048, 512] per layer), requiring
+#   ~3 GB per layer × 40 layers = 120 GB of extra memory during JIT
+#   compilation, which causes OOM on systems with < 200 GB RAM.
+#
+#   The gather approach only materializes the top_k=8 weight slices per token:
+#   S = seq_total × top_k (e.g. 4 × 8 = 32) instead of E × seq_total (256 × 4).
+#   This reduces peak expert-weight memory from ~120 GB to ~500 MB and also
+#   allows OV to apply its MoE-specific sparse optimizations on the Gather +
+#   BMM pattern.
 # ------------------------------------------------------------------------------
 def patched_qwen3_5_moe_sparse_block(self, hidden_states: torch.Tensor):
-    """Vectorized forward for Qwen3_5MoeSparseMoeBlock (traceable by torch.jit)."""
+    """Gather-based forward for Qwen3_5MoeSparseMoeBlock (traceable, memory-efficient)."""
     batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hidden_states_flat = hidden_states.view(-1, hidden_dim)  # [seq_total, hidden]
+    hidden_states_flat = hidden_states.view(-1, hidden_dim)  # [T, hidden]
+    T = hidden_states_flat.shape[0]
 
     # Shared expert path
     shared_expert_output = self.shared_expert(hidden_states_flat)
@@ -8867,37 +8881,40 @@ def patched_qwen3_5_moe_sparse_block(self, hidden_states: torch.Tensor):
         * shared_expert_output
     )
 
-    # Routing
+    # Routing: gate returns (router_logits, router_scores, router_indices)
     _, routing_weights, selected_experts = self.gate(hidden_states_flat)
-    # routing_weights: [seq_total, top_k], selected_experts: [seq_total, top_k]
+    # routing_weights: [T, top_k], selected_experts: [T, top_k]
+    top_k = selected_experts.shape[1]
 
-    seq_total = hidden_states_flat.shape[0]
-    num_experts = self.experts.num_experts
+    # Flatten token-expert pairs: S = T × top_k
+    expert_ids = selected_experts.reshape(-1)          # [S]
+    sample_weights = routing_weights.reshape(-1)        # [S]
+    token_indices = (
+        torch.arange(T, device=hidden_states.device)
+        .unsqueeze(1)
+        .expand(-1, top_k)
+        .reshape(-1)
+    )                                                   # [S]
 
-    # Scatter routing weights to dense [seq_total, num_experts] matrix
-    new_routing_weights = torch.zeros(
-        seq_total, num_experts,
-        dtype=routing_weights.dtype, device=routing_weights.device,
-    )
-    new_routing_weights.scatter_(dim=1, index=selected_experts, src=routing_weights)
+    # Gather the hidden states and expert weights for each (token, expert) pair
+    selected_hidden = hidden_states_flat[token_indices]          # [S, hidden]
+    selected_gate_up = self.experts.gate_up_proj[expert_ids]     # [S, 2*intermediate, hidden]
+    selected_down = self.experts.down_proj[expert_ids]           # [S, hidden, intermediate]
 
-    # Batched expert computation:  [num_experts, seq_total, hidden]
-    hidden_rep = hidden_states_flat.unsqueeze(0).expand(num_experts, -1, -1)
+    # Per-(token, expert) forward pass using batched matmul:
+    #   gate_up = W_gate_up @ x  →  [S, 2*intermediate]
+    gate_up = torch.bmm(selected_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
+    gate, up = gate_up.chunk(2, dim=-1)                          # each [S, intermediate]
+    gate_up_out = self.experts.act_fn(gate) * up                 # [S, intermediate]
 
-    # gate_up_proj: [num_experts, 2*intermediate, hidden] → transpose → [num_experts, hidden, 2*intermediate]
-    gate_up = torch.bmm(hidden_rep, self.experts.gate_up_proj.transpose(1, 2))
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate_up_out = self.experts.act_fn(gate) * up
+    #   out = W_down @ gate_up_out  →  [S, hidden]
+    expert_out = torch.bmm(selected_down, gate_up_out.unsqueeze(-1)).squeeze(-1)  # [S, hidden]
 
-    # down_proj: [num_experts, hidden, intermediate] → transpose → [num_experts, intermediate, hidden]
-    expert_out = torch.bmm(gate_up_out, self.experts.down_proj.transpose(1, 2))
-    # expert_out: [num_experts, seq_total, hidden]
+    # Apply routing weights and sum top_k contributions per token
+    weighted_out = expert_out * sample_weights.unsqueeze(-1)     # [S, hidden]
+    final_out = weighted_out.view(T, top_k, hidden_dim).sum(dim=1)  # [T, hidden]
 
-    # Weight by routing: new_routing_weights.T → [num_experts, seq_total]
-    expert_out = expert_out * new_routing_weights.T.unsqueeze(-1)
-    expert_out = expert_out.sum(dim=0)  # [seq_total, hidden]
-
-    output = expert_out + shared_expert_output
+    output = final_out + shared_expert_output
     return output.view(batch_size, sequence_length, hidden_dim)
 
 
