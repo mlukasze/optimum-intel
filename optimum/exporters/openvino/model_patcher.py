@@ -73,6 +73,14 @@ if is_transformers_version(">=", "4.56"):
     import transformers.masking_utils
 if is_transformers_version(">=", "5"):
     from transformers.modeling_rope_utils import RotaryEmbeddingConfigMixin
+    try:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeGatedDeltaNet,
+            Qwen3_5MoeSparseMoeBlock,
+        )
+    except ImportError:
+        Qwen3_5MoeGatedDeltaNet = None
+        Qwen3_5MoeSparseMoeBlock = None
 
 if TYPE_CHECKING:
     from transformers.cache_utils import Cache
@@ -255,16 +263,116 @@ def patch_cos_sin_cached_fp32(model):
 # Specifically for OpenVINO, we use torch.finfo(torch.float16).min instead of torch.finfo(dtype).min
 def eager_mask_without_vmap(*args, **kwargs) -> Optional[torch.Tensor]:
     kwargs.pop("allow_is_causal_skip", None)
-    dtype = kwargs.get("dtype", torch.float32)
-    mask = sdpa_mask_without_vmap(*args, allow_is_causal_skip=False, **kwargs)
-    # we use torch.finfo(torch.float16).min instead torch.finfo(dtype).min to avoid an overflow but not
-    # sure this is the right way to handle this, we are basically pretending that -65,504 is -inf
-    mask = torch.where(
-        mask,
-        torch.tensor(0.0, device=mask.device, dtype=dtype),
-        torch.tensor(torch.finfo(torch.float16).min, device=mask.device, dtype=dtype),
-    )
-    return mask
+    dtype = kwargs.pop("dtype", torch.float32)
+
+    # In transformers 5.x, create_causal_mask calls the mask interface with keyword-only
+    # arguments (batch_size, q_length, kv_length, q_offset, ...).
+    # During OV jit.trace, shape accesses like inputs_embeds.shape[1] return 0-dim symbolic
+    # Tensors (not Python ints), and cache sizes like key_cache.shape[-2] are also symbolic.
+    # Critically, we must NOT convert these to concrete Python ints via .item() because that
+    # would cause torch.arange(concrete_int) to generate a STATIC constant in the OV graph,
+    # making the attention mask shape non-dynamic and breaking inference with variable sequence
+    # lengths.  Instead, we compute the causal mask directly using tensor broadcasting so that
+    # OV can track all size dependencies symbolically and produce fully dynamic output shapes.
+    q_length = kwargs.pop("q_length", None)
+    if q_length is not None:
+        # New-style transformers 5.x API
+        batch_size = kwargs.pop("batch_size", 1)
+        kv_length = kwargs.pop("kv_length", q_length)
+        q_offset = kwargs.pop("q_offset", 0)
+        kv_offset = kwargs.pop("kv_offset", 0)
+        attention_mask = kwargs.pop("attention_mask", None)
+        mask_function = kwargs.pop("mask_function", None)
+        device = kwargs.pop("device", None)
+        # Pop remaining new-style kwargs
+        kwargs.pop("config", None)
+        kwargs.pop("use_vmap", None)
+
+        # Determine target device without calling .item() on any tensor
+        if device is None:
+            for _candidate in (q_length, kv_length, q_offset, attention_mask):
+                if isinstance(_candidate, torch.Tensor):
+                    device = _candidate.device
+                    break
+            if device is None:
+                device = torch.device("cpu")
+
+        # Build position ranges WITHOUT converting symbolic tensors to Python ints.
+        # torch.arange(symbolic_tensor) creates a dynamic Range op in the OV graph,
+        # preserving full dynamic shape information through the mask computation.
+        q_arange = torch.arange(q_length, device=device)    # shape [q_len]
+        kv_arange = torch.arange(kv_length, device=device)  # shape [kv_len]
+
+        # Absolute token positions for query and key/value sequences
+        q_positions = q_arange + q_offset    # [q_len]
+        kv_positions = kv_arange + kv_offset  # [kv_len]
+
+        # Standard causal mask: query token i can attend to kv token j iff j <= i
+        # (i.e. kv_positions[j] <= q_positions[i])
+        # Shape: [q_len, kv_len] → [1, 1, q_len, kv_len]
+        causal_mask = kv_positions[None, :] <= q_positions[:, None]
+        causal_mask = causal_mask[None, None, :, :]
+
+        # Convert the boolean causal mask to the additive float mask EARLY so we can
+        # combine it with the attention mask without a BitwiseAnd node (which OV CPU
+        # eltwise shape inference rejects when both inputs have equal dynamic dims ≠ 1).
+        # Standard approach: additive masking — causal_f + padding_f, both in float.
+        neg_inf = torch.tensor(torch.finfo(torch.float16).min, device=device, dtype=dtype)
+        zero = torch.tensor(0.0, device=device, dtype=dtype)
+        causal_f = torch.where(causal_mask, zero, neg_inf)   # [1, 1, q_len, kv_len]
+
+        if attention_mask is not None:
+            # Build the padded attention mask [batch, kv_len] using Gather so that
+            # the output's last dimension is *symbolically identical* to kv_arange's
+            # length (= kv_len).  Simply cat([attn, suffix]) leaves the dim as
+            # attn_len + (kv_len - attn_len) which OV's Eltwise shape checker does
+            # NOT simplify to kv_len, causing "dim 3 mismatch" on Add/Select nodes.
+            #
+            # Strategy: index attention_mask with clamped kv_arange positions.
+            #   j  = kv_arange[j]       → position in [0, kv_len)
+            #   For j  < attn_len : padded[j] = attention_mask[j]
+            #   For j >= attn_len : padded[j] = 1  (new query tokens, always valid)
+            #
+            # This produces shape [batch, kv_len] where kv_len traces through
+            # kv_arange → Clamp → Gather, so it stays the same symbolic dim as
+            # kv_arange throughout — identical to causal_f's dim-3.
+            attn_len = attention_mask.shape[-1]          # scalar (dynamic ShapeOf)
+            # Clamp j to [0, attn_len-1] so Gather never goes out-of-bounds.
+            j_clamped = torch.clamp(kv_arange, max=attn_len - 1)  # [kv_len]
+            # Gather attention values: attention_mask[:, j_clamped] → [batch, kv_len]
+            attn_gathered = attention_mask[:, j_clamped]           # [batch, kv_len]
+            # Positions j >= attn_len are always valid (= new query positions).
+            j_past = kv_arange < attn_len                          # [kv_len]  bool
+            # padded[b, j] = attn_gathered[b, j] if j < attn_len else 1
+            # Multiply by j_past to zero out gather noise beyond attn boundary,
+            # then OR with ~j_past to set those positions to 1.
+            attn_gathered_b = attn_gathered.bool()
+            padded_attn_bool = (attn_gathered_b & j_past[None, :]) | (~j_past[None, :])
+            # [batch, kv_len]  — dim-1 tracks kv_arange.shape symbolically ✓
+            # Convert to additive float mask and broadcast-add to causal_f.
+            # Shapes: causal_f [1,1,q,kv] + padding_f [batch,1,1,kv] → [batch,1,q,kv]
+            # Both dim-3 values are kv_arange.shape → OV proves them equal ✓
+            padding_f = torch.where(padded_attn_bool[:, None, None, :], zero, neg_inf)
+            mask = causal_f + padding_f
+        else:
+            mask = causal_f
+            # No padding mask: expand the batch dimension if concrete.
+            if not isinstance(batch_size, torch.Tensor):
+                mask = mask.expand(batch_size, -1, -1, -1)
+
+        return mask
+    else:
+        # Transformers 4.x old-style API (cache_position as positional Tensor arg)
+        mask = sdpa_mask_without_vmap(*args, allow_is_causal_skip=False, **kwargs)
+        if mask is None:
+            return mask
+        # Convert to float additive mask
+        mask = torch.where(
+            mask,
+            torch.tensor(0.0, device=mask.device, dtype=dtype),
+            torch.tensor(torch.finfo(torch.float16).min, device=mask.device, dtype=dtype),
+        )
+        return mask
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/3c307e380ad07ca16903a39e09a47d532cb782d9/src/transformers/models/phimoe/modular_phimoe.py#L57
@@ -6610,7 +6718,11 @@ class MambaPatcher(ModelPatcher):
         model: "PreTrainedModel",
         model_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        from transformers.models.mamba.modeling_mamba import MambaCache
+        try:
+            from transformers.models.mamba.modeling_mamba import MambaCache
+        except ImportError:
+            class MambaCache:  # type: ignore[no-redef]
+                pass
 
         super().__init__(config, model, model_kwargs)
 
@@ -8496,3 +8608,443 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
                 sparse_moe_block = decoder_layer.mlp
                 decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
                 del sparse_moe_block.down_projs, sparse_moe_block.gate_projs, sparse_moe_block.up_projs
+
+
+# ==============================================================================
+# Qwen3_5Moe (qwen3_5_moe) model patcher
+#
+# Architecture: Hybrid attention + GatedDeltaNet linear attention + SparseMoE
+# This model is structurally similar to Qwen3-Next but uses a different cache
+# API (DynamicCache with per-layer LinearAttentionLayer / DynamicLayer objects)
+# and different projection names in GatedDeltaNet.
+#
+# The patcher:
+#  1. Wraps the flat OV cache_params list into a DynamicCache-compatible wrapper.
+#  2. Patches GatedDeltaNet.forward to use OV-compatible recurrent computation.
+#  3. Patches SparseMoeBlock with a vectorized (traceable) forward.
+# ==============================================================================
+
+
+class Qwen3_5MoeDynamicCacheWrap:
+    """
+    Wraps flat OV cache tensors as a DynamicCache-compatible object
+    for Qwen3_5Moe (hybrid GatedDeltaNet + Full-Attention + MoE).
+
+    Flat layout (same as Qwen3Next patcher convention):
+      [conv_0, rec_0, conv_1, rec_1, ...  (linear_attention layers)
+       key_0, val_0, key_1, val_1, ...    (full_attention layers)]
+    """
+
+    def __init__(self, config, conv_states, recurrent_states, key_cache, value_cache):
+        # Build global-layer-idx → local-type-idx mappings
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            # For the full VLM config, text config carries layer_types
+            layer_types = config.text_config.layer_types
+
+        self._layer_types = layer_types
+        self.linear_attn_mapping = {}   # global → local linear_attn idx
+        self.full_attn_mapping = {}     # global → local full_attn idx
+        linear_idx = 0
+        full_idx = 0
+        for i, lt in enumerate(layer_types):
+            if lt == "linear_attention":
+                self.linear_attn_mapping[i] = linear_idx
+                linear_idx += 1
+            elif lt == "full_attention":
+                self.full_attn_mapping[i] = full_idx
+                full_idx += 1
+
+        self.conv_states = list(conv_states)
+        self.recurrent_states = list(recurrent_states)
+        self.key_cache = list(key_cache)
+        self.value_cache = list(value_cache)
+
+    # ------------------------------------------------------------------ #
+    # Linear-attention cache API (called by patched GatedDeltaNet forward)
+    # ------------------------------------------------------------------ #
+
+    def has_previous_state(self, layer_idx=None):
+        """Return True if any linear-attention layer has a cached state."""
+        if layer_idx is not None:
+            if layer_idx not in self.linear_attn_mapping:
+                return False
+            local_idx = self.linear_attn_mapping[layer_idx]
+            return self.conv_states[local_idx] is not None
+        # Called without arg from _update_linear_attn_mask
+        return any(s is not None for s in self.conv_states)
+
+    def update_conv_state(self, conv_state, layer_idx, **kwargs):
+        local_idx = self.linear_attn_mapping[layer_idx]
+        self.conv_states[local_idx] = conv_state
+        return conv_state
+
+    def update_recurrent_state(self, recurrent_state, layer_idx, **kwargs):
+        local_idx = self.linear_attn_mapping[layer_idx]
+        self.recurrent_states[local_idx] = recurrent_state
+        return recurrent_state
+
+    # ------------------------------------------------------------------ #
+    # Full-attention cache API (called by Qwen3_5MoeAttention.forward)
+    # ------------------------------------------------------------------ #
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        local_idx = self.full_attn_mapping[layer_idx]
+        if self.key_cache[local_idx] is None:
+            self.key_cache[local_idx] = key_states
+            self.value_cache[local_idx] = value_states
+        else:
+            self.key_cache[local_idx] = torch.cat(
+                [self.key_cache[local_idx], key_states], dim=2
+            )
+            self.value_cache[local_idx] = torch.cat(
+                [self.value_cache[local_idx], value_states], dim=2
+            )
+        return self.key_cache[local_idx], self.value_cache[local_idx]
+
+    # ------------------------------------------------------------------ #
+    # Sequence-length / mask API (called by create_causal_mask and model)
+    # ------------------------------------------------------------------ #
+
+    def get_seq_length(self, layer_idx=0):
+        """Return the number of past tokens from the full-attention KV cache."""
+        for local_idx in range(len(self.key_cache)):
+            if self.key_cache[local_idx] is not None:
+                return self.key_cache[local_idx].shape[-2]
+        return 0
+
+    def get_mask_sizes(self, query_length, layer_idx=0):
+        """Return (kv_length, kv_offset) for the full-attention causal mask.
+
+        kv_offset is always 0 for this non-sliding-window cache: the KV cache stores
+        all tokens from position 0.  This matches DynamicLayer.get_mask_sizes().
+        """
+        # If layer_idx is a linear-attention layer, find the first full-attention layer
+        if layer_idx not in self.full_attn_mapping:
+            try:
+                layer_idx = next(
+                    i for i, lt in enumerate(self._layer_types) if lt == "full_attention"
+                )
+            except StopIteration:
+                return query_length, 0
+
+        local_idx = self.full_attn_mapping.get(layer_idx, 0)
+        if local_idx >= len(self.key_cache) or self.key_cache[local_idx] is None:
+            return query_length, 0
+        past_len = self.key_cache[local_idx].shape[-2]
+        # kv_offset = 0 (not past_len): the cache covers positions [0, past_len),
+        # so the kv window starts at position 0, not past_len.
+        return query_length + past_len, 0
+
+    # ------------------------------------------------------------------ #
+    # Misc API used by transformers internals
+    # ------------------------------------------------------------------ #
+
+    @property
+    def is_compileable(self):
+        return False
+
+    @property
+    def is_sliding(self):
+        """Return a list of bool: True for linear-attention (sliding/recurrent) layers,
+        False for full-attention layers.  Used by create_causal_mask to pick the right
+        layer_idx when computing kv_length / kv_offset.
+        """
+        return [lt == "linear_attention" for lt in self._layer_types]
+
+
+# ------------------------------------------------------------------------------
+# Patched GatedDeltaNet forward for Qwen3_5Moe
+#
+# Adapted from qwen3_next_gated_delta_net_forward.
+# Key differences vs Qwen3Next:
+#   - Projection names: in_proj_qkv / in_proj_z / in_proj_b / in_proj_a
+#     (Qwen3Next uses in_proj_qkvz / in_proj_ba + fix_query_key_value_ordering)
+#   - Cache access via cache_params.linear_attn_mapping / conv_states /
+#     recurrent_states (same convention as our Qwen3_5MoeDynamicCacheWrap)
+# ------------------------------------------------------------------------------
+def qwen3_5_moe_gated_delta_net_forward(
+    self,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask=None,
+):
+    def apply_mask_to_padding_states(hidden_states, attention_mask):
+        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+            dtype = hidden_states.dtype
+            hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+        return hidden_states
+
+    hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+    batch_size, seq_len, _ = hidden_states.shape
+
+    recurrent_state = None
+    local_idx = None
+    if cache_params is not None:
+        local_idx = cache_params.linear_attn_mapping[self.layer_idx]
+        conv_state = cache_params.conv_states[local_idx]
+        recurrent_state = cache_params.recurrent_states[local_idx]
+
+    # Projections (different from Qwen3Next)
+    mixed_qkv = self.in_proj_qkv(hidden_states)      # [B, T, key_dim*2 + value_dim]
+    z = self.in_proj_z(hidden_states)                 # [B, T, value_dim]
+    z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
+    b = self.in_proj_b(hidden_states)                 # [B, T, num_v_heads]
+    a = self.in_proj_a(hidden_states)                 # [B, T, num_v_heads]
+
+    mixed_qkv = mixed_qkv.transpose(1, 2)            # [B, key_dim*2+value_dim, T]
+
+    if cache_params is not None:
+        new_mixed_qkv, new_conv_state = ov_causal_conv1d(
+            conv_state, mixed_qkv, self.conv1d.weight, self.conv1d.bias
+        )
+        mixed_qkv = torch.nn.functional.silu(new_mixed_qkv)
+        cache_params.conv_states[local_idx] = new_conv_state
+    else:
+        mixed_qkv = torch.nn.functional.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+
+    mixed_qkv = mixed_qkv.transpose(1, 2)            # [B, T, key_dim*2+value_dim]
+    query, key, value = torch.split(
+        mixed_qkv,
+        [self.key_dim, self.key_dim, self.value_dim],
+        dim=-1,
+    )
+
+    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+    beta = b.sigmoid()
+    g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+
+    if self.num_v_heads // self.num_k_heads > 1:
+        query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+    # Use patched_recurrent_gated_delta_rule (shared with Qwen3Next patcher)
+    # which internally uses RecurrentAttentionCell for OV tracing
+    core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+        self,
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=recurrent_state,
+        output_final_state=cache_params is not None,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    if cache_params is not None:
+        cache_params.recurrent_states[local_idx] = last_recurrent_state
+
+    z_shape_og = z.shape
+    core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+    z = z.reshape(-1, z.shape[-1])
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(z_shape_og)
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+
+    output = self.out_proj(core_attn_out)
+    return output
+
+
+# ------------------------------------------------------------------------------
+# Vectorized SparseMoeBlock forward for Qwen3_5Moe
+#
+# Replaces the dynamic loop in Qwen3_5MoeExperts.forward with batched matmul,
+# which is fully traceable and benefits from OV MoE optimizations.
+# ------------------------------------------------------------------------------
+def patched_qwen3_5_moe_sparse_block(self, hidden_states: torch.Tensor):
+    """Vectorized forward for Qwen3_5MoeSparseMoeBlock (traceable by torch.jit)."""
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_flat = hidden_states.view(-1, hidden_dim)  # [seq_total, hidden]
+
+    # Shared expert path
+    shared_expert_output = self.shared_expert(hidden_states_flat)
+    shared_expert_output = (
+        torch.nn.functional.sigmoid(self.shared_expert_gate(hidden_states_flat))
+        * shared_expert_output
+    )
+
+    # Routing
+    _, routing_weights, selected_experts = self.gate(hidden_states_flat)
+    # routing_weights: [seq_total, top_k], selected_experts: [seq_total, top_k]
+
+    seq_total = hidden_states_flat.shape[0]
+    num_experts = self.experts.num_experts
+
+    # Scatter routing weights to dense [seq_total, num_experts] matrix
+    new_routing_weights = torch.zeros(
+        seq_total, num_experts,
+        dtype=routing_weights.dtype, device=routing_weights.device,
+    )
+    new_routing_weights.scatter_(dim=1, index=selected_experts, src=routing_weights)
+
+    # Batched expert computation:  [num_experts, seq_total, hidden]
+    hidden_rep = hidden_states_flat.unsqueeze(0).expand(num_experts, -1, -1)
+
+    # gate_up_proj: [num_experts, 2*intermediate, hidden] → transpose → [num_experts, hidden, 2*intermediate]
+    gate_up = torch.bmm(hidden_rep, self.experts.gate_up_proj.transpose(1, 2))
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate_up_out = self.experts.act_fn(gate) * up
+
+    # down_proj: [num_experts, hidden, intermediate] → transpose → [num_experts, intermediate, hidden]
+    expert_out = torch.bmm(gate_up_out, self.experts.down_proj.transpose(1, 2))
+    # expert_out: [num_experts, seq_total, hidden]
+
+    # Weight by routing: new_routing_weights.T → [num_experts, seq_total]
+    expert_out = expert_out * new_routing_weights.T.unsqueeze(-1)
+    expert_out = expert_out.sum(dim=0)  # [seq_total, hidden]
+
+    output = expert_out + shared_expert_output
+    return output.view(batch_size, sequence_length, hidden_dim)
+
+
+# ------------------------------------------------------------------------------
+# Qwen3_5Moe model patcher
+# ------------------------------------------------------------------------------
+class Qwen3_5MoeModelPatcher(OVDecoderModelPatcher):
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: "PreTrainedModel",
+        model_kwargs=None,
+    ):
+        super().__init__(config, model, model_kwargs)
+
+        # Determine the text config (ForCausalLM has text config directly; ForConditionalGeneration wraps it)
+        lm_config = model.config
+        if hasattr(lm_config, "text_config"):
+            text_config = lm_config.text_config
+        else:
+            text_config = lm_config
+
+        layer_types = text_config.layer_types
+        num_linear_layers = layer_types.count("linear_attention")
+        num_full_layers = layer_types.count("full_attention")
+
+        from openvino.frontend.pytorch import ConversionExtension, ModuleExtension
+
+        def patched_forward(
+            input_ids,
+            attention_mask=None,
+            cache_params=None,
+        ):
+            use_cache = False
+            wrapped_cache = None
+
+            if cache_params is not None:
+                use_cache = True
+                conv_states = []
+                recurrent_states = []
+                key_cache = []
+                value_cache = []
+
+                for idx in range(num_linear_layers):
+                    conv_states.append(cache_params[2 * idx])
+                    recurrent_states.append(cache_params[2 * idx + 1])
+
+                for idx in range(num_full_layers):
+                    base = 2 * num_linear_layers
+                    key_cache.append(cache_params[base + 2 * idx])
+                    value_cache.append(cache_params[base + 2 * idx + 1])
+
+                wrapped_cache = Qwen3_5MoeDynamicCacheWrap(
+                    text_config, conv_states, recurrent_states, key_cache, value_cache
+                )
+
+            causal_lm_output = self.model_orig_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=wrapped_cache,
+                use_cache=use_cache,
+            )
+
+            outputs = {"logits": causal_lm_output.logits}
+
+            if use_cache:
+                present_key_values = []
+                for idx in range(num_linear_layers):
+                    present_key_values.append(wrapped_cache.conv_states[idx])
+                    present_key_values.append(wrapped_cache.recurrent_states[idx])
+                for idx in range(num_full_layers):
+                    present_key_values.append(wrapped_cache.key_cache[idx])
+                    present_key_values.append(wrapped_cache.value_cache[idx])
+                outputs["present_key_values"] = present_key_values
+
+            return outputs
+
+        self.patched_forward = patched_forward
+        self.model_orig_forward = self.orig_forward
+        self.orig_forward = patched_forward
+
+        self.module_extensions = {
+            RecurrentAttentionCell: ModuleExtension(RecurrentAttentionCell, "RecurrentAttentionCellOp"),
+        }
+        self.conversion_extensions = [
+            ConversionExtension("RecurrentAttentionCellOp", convert_recurrent_attention_cell),
+        ]
+
+    def __enter__(self):
+        if Qwen3_5MoeGatedDeltaNet is None or Qwen3_5MoeSparseMoeBlock is None:
+            raise ImportError(
+                "Qwen3_5Moe support requires transformers >= 5.0 with "
+                "Qwen3_5MoeGatedDeltaNet and Qwen3_5MoeSparseMoeBlock."
+            )
+
+        super().__enter__()
+        setattr(self._model, self.orig_forward_name, self.patched_forward)
+
+        lm_config = self._model.config
+        if hasattr(lm_config, "text_config"):
+            layer_types = lm_config.text_config.layer_types
+        else:
+            layer_types = lm_config.layer_types
+
+        # For ForCausalLM: self._model.model is the text model
+        # For ForConditionalGeneration: self._model.model.language_model is the text model
+        text_model = getattr(self._model, "model", None)
+        if hasattr(text_model, "language_model"):
+            text_model = text_model.language_model
+
+        for idx, decoder_layer in enumerate(text_model.layers):
+            layer_type = layer_types[idx]
+            if layer_type == "linear_attention":
+                linear_attn_layer = decoder_layer.linear_attn
+                linear_attn_layer._orig_forward = linear_attn_layer.forward
+                linear_attn_layer.forward = types.MethodType(
+                    qwen3_5_moe_gated_delta_net_forward, linear_attn_layer
+                )
+                linear_attn_layer.recurrent_gated_delta_rule = patched_recurrent_gated_delta_rule
+                linear_attn_layer.recurrent_attention_cell = RecurrentAttentionCell()
+
+            # Patch SparseMoeBlock for all layers (all layers have MoE mlp)
+            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                sparse_moe_block = decoder_layer.mlp
+                sparse_moe_block._orig_forward = sparse_moe_block.forward
+                sparse_moe_block.forward = types.MethodType(
+                    patched_qwen3_5_moe_sparse_block, sparse_moe_block
+                )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        setattr(self._model, self.orig_forward_name, self.model_orig_forward)
+
+        lm_config = self._model.config
+        if hasattr(lm_config, "text_config"):
+            layer_types = lm_config.text_config.layer_types
+        else:
+            layer_types = lm_config.layer_types
+
+        text_model = getattr(self._model, "model", None)
+        if hasattr(text_model, "language_model"):
+            text_model = text_model.language_model
+
+        for idx, decoder_layer in enumerate(text_model.layers):
+            layer_type = layer_types[idx]
+            if layer_type == "linear_attention":
+                linear_attn_layer = decoder_layer.linear_attn
+                linear_attn_layer.forward = linear_attn_layer._orig_forward
+            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
