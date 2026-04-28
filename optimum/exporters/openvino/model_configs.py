@@ -199,11 +199,11 @@ from .model_patcher import (
     Qwen2MoEPatcher,
     Qwen2VLLanguageModelPatcher,
     Qwen2VLVisionEmbMergerPatcher,
+    Qwen3_5MoeModelPatcher,
     Qwen3MoeModelPatcher,
     Qwen3NextModelPatcher,
     Qwen3VLLanguageModelPatcher,
     Qwen3VLVisionEmbMergerPatcher,
-    Qwen3_5MoeModelPatcher,
     QwenModelPatcher,
     SanaTextEncoderModelPatcher,
     XverseModelPatcher,
@@ -5552,6 +5552,7 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
 # Qwen3_5Moe (qwen3_5_moe) — Hybrid GatedDeltaNet + Full-Attention + MoE
 # ==============================================================================
 
+
 class Qwen3_5MoeDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
     """
     Generates dummy cache_params inputs for Qwen3_5Moe architectures.
@@ -5642,7 +5643,6 @@ class Qwen3_5MoeOpenVINOConfig(Qwen3NextOpenVINOConfig):
     DUMMY_PKV_GENERATOR_CLASS = Qwen3_5MoeDummyPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     MIN_TRANSFORMERS_VERSION = "5.0.0"
-    MAX_TRANSFORMERS_VERSION = None  # no upper bound: works with transformers >= 5.0.0
     _MODEL_PATCHER = Qwen3_5MoeModelPatcher
 
     def _get_layer_types(self):

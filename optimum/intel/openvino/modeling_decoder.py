@@ -31,13 +31,18 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateOutput, GenerationMode
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
+
+
 try:
     from transformers.models.mamba.modeling_mamba import MambaCache
 except ImportError:
     # MambaCache was removed from transformers>=5.7; provide a minimal base class
     class MambaCache:  # type: ignore[no-redef]
         """Minimal base class replacement when MambaCache is not available in transformers."""
+
         pass
+
+
 from transformers.utils.hub import PushToHubMixin
 
 from optimum.utils.normalized_config import NormalizedConfigManager
@@ -1505,7 +1510,13 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
                 # decoding stage so it takes the last token
                 input_ids = input_ids[:, -1].unsqueeze(-1)
 
-                if self.config.model_type not in ["lfm2", "granitemoehybrid", "qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"]:
+                if self.config.model_type not in [
+                    "lfm2",
+                    "granitemoehybrid",
+                    "qwen3_next",
+                    "qwen3_5_moe",
+                    "qwen3_5_moe_text",
+                ]:
                     # LFM2, GraniteMoeHybrid (Granite-4.0), and Qwen3-Next require the attention mask
                     # to be the length of the full context, so default mask from OVModelForCausalLM needs to be used.
                     # Other models like Mamba typically do not require an attention_mask
@@ -1544,6 +1555,7 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
             }
         )
         return model_inputs
+
 
 class OVMambaForCausalLM(OVModelWithMambaForCausalLM):
     def __init__(
