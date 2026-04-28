@@ -764,6 +764,16 @@ class OVModelForCausalLM(OVBaseDecoderModel, GenerationMixin):
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
+        # Reset _past_length at the start of every generate() call for stateful models.
+        # After the first generate(), _past_length > 0. Without this reset,
+        # OVModelWithMambaForCausalLM.prepare_inputs_for_generation() sees a stale
+        # _past_length > 0 and incorrectly treats the first step of subsequent
+        # generate() calls as a decode step (is_decode=True), truncating the full
+        # prompt to its last token and producing garbage output.
+        # This protects all stateful causal LM models (Mamba, Qwen3.6-35B-A3B, etc.)
+        if self.stateful:
+            self._past_length = 0
+
         _generation_config, _ = self._prepare_generation_config(generation_config, **kwargs)
         generation_mode = _generation_config.get_generation_mode(assistant_model)
 
@@ -1534,7 +1544,6 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
             }
         )
         return model_inputs
-
 
 class OVMambaForCausalLM(OVModelWithMambaForCausalLM):
     def __init__(
