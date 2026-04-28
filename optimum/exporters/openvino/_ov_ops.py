@@ -30,6 +30,17 @@ def convert_recurrent_attention_cell(context):
     beta = context.get_input(4)
     last_recurrent_state_old = context.get_input(5)
 
+    # Explicitly cast all inputs to FP32 to prevent OV BF16 inference-mode from
+    # downscaling the recurrent-state update, which can corrupt the GatedDeltaNet
+    # hidden state and cause repetition loops or premature EOS (observed on
+    # Qwen3.6-35B-A3B where mamba_ssm_dtype=float32 is required for correctness).
+    query = ops.convert(query, "f32")
+    key = ops.convert(key, "f32")
+    value = ops.convert(value, "f32")
+    g = ops.convert(g, "f32")
+    beta = ops.convert(beta, "f32")
+    last_recurrent_state_old = ops.convert(last_recurrent_state_old, "f32")
+
     value_shape = ops.shape_of(value)
     const_zero = ops.constant(0, dtype=np.float32)
     core_attn_out = ops.broadcast(const_zero, value_shape)

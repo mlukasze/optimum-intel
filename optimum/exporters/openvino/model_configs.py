@@ -199,6 +199,7 @@ from .model_patcher import (
     Qwen2MoEPatcher,
     Qwen2VLLanguageModelPatcher,
     Qwen2VLVisionEmbMergerPatcher,
+    Qwen3_5MoeModelPatcher,
     Qwen3MoeModelPatcher,
     Qwen3NextModelPatcher,
     Qwen3VLLanguageModelPatcher,
@@ -5545,3 +5546,130 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
                 )
 
         return dummy_inputs
+
+
+# ==============================================================================
+# Qwen3_5Moe (qwen3_5_moe) — Hybrid GatedDeltaNet + Full-Attention + MoE
+# ==============================================================================
+
+
+class Qwen3_5MoeDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
+    """
+    Generates dummy cache_params inputs for Qwen3_5Moe architectures.
+
+    Cache layout (flat list, same convention as Qwen3NextDummyPastKeyValuesGenerator):
+      [conv_0, rec_0, ..., conv_N-1, rec_N-1,   ← linear_attention layers
+       key_0, val_0, ..., key_M-1, val_M-1]      ← full_attention layers
+    """
+
+    SUPPORTED_INPUT_NAMES = ("cache_params",)
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        super().__init__(
+            task=task,
+            normalized_config=normalized_config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            **kwargs,
+        )
+
+        # The normalized_config.config may be Qwen3_5MoeTextConfig or Qwen3_5MoeConfig
+        raw_cfg = normalized_config.config
+        text_cfg = getattr(raw_cfg, "text_config", raw_cfg)
+
+        self.num_full_attn_layers = text_cfg.layer_types.count("full_attention")
+        self.num_linear_attn_layers = text_cfg.layer_types.count("linear_attention")
+        self.conv_kernel_size = text_cfg.linear_conv_kernel_dim
+        self.head_dim = getattr(text_cfg, "head_dim", text_cfg.hidden_size // text_cfg.num_attention_heads)
+        self.head_k_dim = text_cfg.linear_key_head_dim
+        self.head_v_dim = text_cfg.linear_value_head_dim
+        self.num_v_heads = text_cfg.linear_num_value_heads
+        self.num_k_heads = text_cfg.linear_num_key_heads
+        self.num_key_value_heads = text_cfg.num_key_value_heads
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        cache_params = []
+
+        for _ in range(self.num_linear_attn_layers):
+            # conv_state shape: [batch, conv_dim, conv_kernel_size]
+            # conv_dim = key_dim * 2 + value_dim, similar to Qwen3Next
+            d_inner = self.num_k_heads * (2 * self.head_k_dim + self.head_v_dim * self.num_v_heads // self.num_k_heads)
+            conv_state_shape = (self.batch_size, d_inner, self.conv_kernel_size)
+            conv_state = self.random_float_tensor(conv_state_shape, framework=framework, dtype=float_dtype)
+            cache_params.append(conv_state)
+
+            # recurrent_state shape: [batch, num_v_heads, head_k_dim, head_v_dim]
+            recurrent_state_shape = (self.batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+            recurrent_state = self.random_float_tensor(recurrent_state_shape, framework=framework, dtype=float_dtype)
+            cache_params.append(recurrent_state)
+
+        for _ in range(self.num_full_attn_layers):
+            kv_shape = (self.batch_size, self.num_key_value_heads, self.sequence_length, self.head_dim)
+            k = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)
+            v = self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype)
+            cache_params.append(k)
+            cache_params.append(v)
+
+        return cache_params
+
+
+@register_in_tasks_manager(
+    "qwen3_5_moe",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+@register_in_tasks_manager(
+    "qwen3_5_moe_text",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class Qwen3_5MoeOpenVINOConfig(Qwen3NextOpenVINOConfig):
+    """
+    OV export config for Qwen3_5Moe (qwen3_5_moe).
+
+    Inherits the add_past_key_values / inputs / outputs logic from
+    Qwen3NextOpenVINOConfig since both models share the same hybrid cache
+    layout (linear_attention states + full_attention KV).
+    """
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, Qwen3_5MoeDummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = Qwen3_5MoeDummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    MIN_TRANSFORMERS_VERSION = "5.0.0"
+    _MODEL_PATCHER = Qwen3_5MoeModelPatcher
+
+    def _get_layer_types(self):
+        """Return the layer_types list, handling both Qwen3_5MoeConfig and Qwen3_5MoeTextConfig."""
+        raw_cfg = self._normalized_config.config
+        text_cfg = getattr(raw_cfg, "text_config", raw_cfg)
+        return text_cfg.layer_types
+
+    def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+
+        if direction == "inputs":
+            decoder_sequence_name = "past_sequence_length"
+            cache_name_prefix = "cache_params.past"
+        else:
+            decoder_sequence_name = "past_sequence_length + sequence_length"
+            cache_name_prefix = "cache_params.present"
+
+        layer_types = self._get_layer_types()
+        self.num_full_attn_layers = layer_types.count("full_attention")
+        self.num_linear_attn_layers = layer_types.count("linear_attention")
+
+        for i in range(self.num_linear_attn_layers):
+            inputs_or_outputs[f"{cache_name_prefix}.conv.{i}"] = {0: "batch_size"}
+            inputs_or_outputs[f"{cache_name_prefix}.ssm.{i}"] = {0: "batch_size"}
+
+        for i in range(self.num_full_attn_layers):
+            inputs_or_outputs[f"{cache_name_prefix}.key.{i}"] = {0: "batch_size", 2: decoder_sequence_name}
+            inputs_or_outputs[f"{cache_name_prefix}.value.{i}"] = {0: "batch_size", 2: decoder_sequence_name}

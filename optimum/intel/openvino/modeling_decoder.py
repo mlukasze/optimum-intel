@@ -31,7 +31,18 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateOutput, GenerationMode
 from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
-from transformers.models.mamba.modeling_mamba import MambaCache
+
+
+try:
+    from transformers.models.mamba.modeling_mamba import MambaCache
+except ImportError:
+    # MambaCache was removed from transformers>=5.7; provide a minimal base class
+    class MambaCache:  # type: ignore[no-redef]
+        """Minimal base class replacement when MambaCache is not available in transformers."""
+
+        pass
+
+
 from transformers.utils.hub import PushToHubMixin
 
 from optimum.utils.normalized_config import NormalizedConfigManager
@@ -758,6 +769,16 @@ class OVModelForCausalLM(OVBaseDecoderModel, GenerationMixin):
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
+        # Reset _past_length at the start of every generate() call for stateful models.
+        # After the first generate(), _past_length > 0. Without this reset,
+        # OVModelWithMambaForCausalLM.prepare_inputs_for_generation() sees a stale
+        # _past_length > 0 and incorrectly treats the first step of subsequent
+        # generate() calls as a decode step (is_decode=True), truncating the full
+        # prompt to its last token and producing garbage output.
+        # This protects all stateful causal LM models (Mamba, Qwen3.6-35B-A3B, etc.)
+        if self.stateful:
+            self._past_length = 0
+
         _generation_config, _ = self._prepare_generation_config(generation_config, **kwargs)
         generation_mode = _generation_config.get_generation_mode(assistant_model)
 
@@ -1093,7 +1114,7 @@ class OVCacheWithMambaStates(MambaCache):
         self.mamba_d_conv = getattr(config, "mamba_d_conv", None)
         self.mamba_expand = getattr(config, "mamba_expand", None)
         self.mamba_d_state = getattr(config, "mamba_d_state", None)
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = getattr(config, "intermediate_size", None)
         self.conv_kernel_size = getattr(config, "conv_kernel", getattr(config, "mamba_d_conv", None))
         if config.model_type == "granitemoehybrid":
             layer_types = getattr(config, "layer_types", None)
@@ -1105,6 +1126,32 @@ class OVCacheWithMambaStates(MambaCache):
             self.mamba_headdim = getattr(config, "mamba_d_head", None)
             self.num_mamba_layers = layer_types.count("mamba")
             self.num_attn_layers = layer_types.count("attention")
+        elif config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            # Qwen3.5-MoE hybrid: GatedDeltaNet linear-attention + full-attention layers.
+            # The "mamba-like" states are GatedDeltaNet conv/recurrent states; the KV cache
+            # belongs to the full-attention layers.
+            text_config = getattr(config, "text_config", config)
+            layer_types = getattr(text_config, "layer_types", [])
+            self.num_mamba_layers = layer_types.count("linear_attention")
+            self.num_attn_layers = layer_types.count("full_attention")
+            self.num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
+            self.head_dim = getattr(text_config, "head_dim", None)
+            # GatedDeltaNet conv-state dimension:
+            #   d_inner = 2 * num_k_heads * key_head_dim + num_v_heads * val_head_dim
+            _nk = getattr(text_config, "linear_num_key_heads", self.num_key_value_heads)
+            _nv = getattr(text_config, "linear_num_value_heads", _nk)
+            _hk = getattr(text_config, "linear_key_head_dim", self.head_dim)
+            _hv = getattr(text_config, "linear_value_head_dim", _hk)
+            _conv_k = getattr(text_config, "linear_conv_kernel_dim", 4)
+            self.conv_kernel_size = _conv_k
+            self._qwen3_5_moe_d_inner = 2 * _nk * _hk + _nv * _hv
+            # Recurrent-state shape: (batch, nv, hk, hv) — stored as ssm_states
+            self._qwen3_5_moe_ssm_shape = (_nv, _hk, _hv)
+            # Remaining fields are unused for this model class but keep them consistent
+            self.mamba_ngroups = None
+            self.n_mamba_heads = None
+            self.ssm_state_size = None
+            self.mamba_headdim = None
         else:
             # Mamba 2 specific parameters
             hybrid_layer_ids = getattr(config, "hybrid_layer_ids", None)
@@ -1123,7 +1170,10 @@ class OVCacheWithMambaStates(MambaCache):
         if self.conv_states is None:
             self.conv_states = []
             for _ in range(self.num_mamba_layers):
-                if (
+                if config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+                    # GatedDeltaNet conv state: (batch, d_inner, conv_kernel_size)
+                    conv_state_shape = (self.max_batch_size, self._qwen3_5_moe_d_inner, self.conv_kernel_size)
+                elif (
                     self.mamba_ngroups
                     and self.mamba_d_state
                     and self.mamba_d_conv
@@ -1147,7 +1197,10 @@ class OVCacheWithMambaStates(MambaCache):
         if self.ssm_states is None:
             self.ssm_states: List[torch.Tensor] = []
             for _ in range(self.num_mamba_layers):
-                if self.n_mamba_heads and self.mamba_headdim:
+                if config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+                    # GatedDeltaNet recurrent state: (batch, num_v_heads, head_k_dim, head_v_dim)
+                    ssm_state_shape = (self.max_batch_size,) + self._qwen3_5_moe_ssm_shape
+                elif self.n_mamba_heads and self.mamba_headdim:
                     # Mamba2 block
                     ssm_state_shape = (
                         self.max_batch_size,
@@ -1272,6 +1325,10 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
 
         if hasattr(config, "conv_kernel") and config.conv_kernel is not None:
             self.conv_kernel = config.conv_kernel
+        elif config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            # Use linear_conv_kernel_dim for Qwen3.5-MoE GatedDeltaNet layers
+            text_config = getattr(config, "text_config", config)
+            self.conv_kernel = getattr(text_config, "linear_conv_kernel_dim", 4)
         else:
             self.conv_kernel = getattr(config, "mamba_d_conv", 4)
 
@@ -1438,24 +1495,45 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
         # Overwitten -- uses `cache_params` as opposed to `past_key_values`
 
         if self.use_cache:
-            # `cache_position` should have been initialized in `generate`
-            if cache_position is None:
-                raise ValueError(
-                    "`cache_position` should not be None as it should have been initialized in "
-                    "`model.generate`, you are responsible for passing in a valid `cache_position` if "
-                    "you are calling `prepare_inputs_for_generation` directly with `use_cache=True`"
-                )
-            if cache_position[0] > 0:
+            # Detect prefill vs. decode.
+            # Transformers ≥ 5.x no longer passes `cache_position` through model_kwargs,
+            # so we fall back to checking `cache_params` (non-stateful) or `_past_length`
+            # (stateful).  When cache_position IS provided we still honour it.
+            if cache_position is not None:
+                is_decode = bool(cache_position[0] > 0)
+            else:
+                # Non-stateful: cache_params is populated on decode steps.
+                # Stateful: _past_length is incremented after each forward pass.
+                is_decode = (cache_params is not None) or (self.stateful and self._past_length > 0)
+
+            if is_decode:
                 # decoding stage so it takes the last token
                 input_ids = input_ids[:, -1].unsqueeze(-1)
 
-                if self.config.model_type not in ["lfm2", "granitemoehybrid", "qwen3_next"]:
+                if self.config.model_type not in [
+                    "lfm2",
+                    "granitemoehybrid",
+                    "qwen3_next",
+                    "qwen3_5_moe",
+                    "qwen3_5_moe_text",
+                ]:
                     # LFM2, GraniteMoeHybrid (Granite-4.0), and Qwen3-Next require the attention mask
                     # to be the length of the full context, so default mask from OVModelForCausalLM needs to be used.
                     # Other models like Mamba typically do not require an attention_mask
                     # for the decoding step after the first token so use attention mask of ones.
                     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
 
+                if cache_position is None:
+                    # Synthesise a minimal cache_position for the current decode step
+                    if self.stateful:
+                        past_len = self._past_length
+                    elif cache_params is not None and hasattr(cache_params, "key_cache") and cache_params.key_cache:
+                        # OVCacheWithMambaStates: get past_len from the KV cache
+                        kc = cache_params.key_cache[0]
+                        past_len = kc.shape[-2] if kc is not None else 0
+                    else:
+                        past_len = 0
+                    cache_position = torch.tensor([past_len], dtype=torch.long, device=input_ids.device)
             else:
                 # we initialize the `cache_position` to full size of `conv_states` at prefill stage
                 # considering padding will be applied when input length is shorter, and truncation
