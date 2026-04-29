@@ -78,7 +78,6 @@ from .utils import (
     set_simplified_chat_template,
 )
 
-
 logger = logging.getLogger(__name__)
 
 if is_torch_available():
@@ -1208,9 +1207,7 @@ def get_wan_animate_models_for_export(pipeline, exporter, int_dtype, float_dtype
 
     # ── 4. VAE Encoder ────────────────────────────────────────────────────────
     vae_encoder = copy.deepcopy(pipeline.vae)
-    vae_encoder.forward = lambda sample: {
-        "latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters
-    }
+    vae_encoder.forward = lambda sample: {"latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters}
     vae_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
         model=vae_encoder,
         exporter=exporter,

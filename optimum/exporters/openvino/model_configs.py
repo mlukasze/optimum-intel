@@ -213,7 +213,6 @@ from .model_patcher import (
     _get_model_attribute,
 )
 
-
 COMMON_TEXT_TASKS = [
     "feature-extraction",
     "fill-mask",
@@ -5574,6 +5573,7 @@ class LFM2MoeOpenVINOConfig(LFM2OpenVINOConfig):
 
 # ─── WanAnimate (Wan2.2-Animate video generation) ──────────────────────────────
 
+
 class WanAnimateTransformerDummyInputGenerator(DummyVisionInputGenerator):
     """Generates dummy inputs for the WanAnimateTransformer3DModel."""
 
@@ -5726,6 +5726,7 @@ class WanAnimateTransformerOpenVINOConfig(SanaTransformerOpenVINOConfig):
         # and UNetOnnxConfig.generate_dummy_inputs which wraps encoder_hidden_states in a list.
         # Use the base ExporterConfig.generate_dummy_inputs instead.
         from optimum.exporters.base import ExporterConfig
+
         return ExporterConfig.generate_dummy_inputs(self, framework=framework, **kwargs)
 
     def patch_model_for_export(self, model, model_kwargs=None):
