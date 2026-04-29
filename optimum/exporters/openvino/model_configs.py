@@ -5624,7 +5624,9 @@ if is_diffusers_available():
             if getattr(normalized_config, "in_channels", None):
                 self.num_channels = normalized_config.in_channels
 
-        def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        def generate(
+            self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"
+        ):
             if input_name in ["hidden_states", "sample"]:
                 # Flux2: packed latent shape is (batch, H*W, in_channels)
                 shape = [self.batch_size, self.height * self.width, self.num_channels]
@@ -5651,7 +5653,9 @@ if is_diffusers_available():
             "txt_ids",
         )
 
-        def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        def generate(
+            self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"
+        ):
             if input_name == "txt_ids":
                 import torch
 

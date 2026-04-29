@@ -1667,6 +1667,7 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, F
     def _from_pretrained(cls, *args, **kwargs):
         """Load pipeline and restore BatchNorm stats on self.vae.bn from config."""
         import types
+
         import torch
 
         pipeline = super()._from_pretrained(*args, **kwargs)
@@ -1768,7 +1769,6 @@ class OVFlux2KleinPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, F
         num_frames: int = -1,
     ):
         """Override to handle Flux2 4D position IDs (img_ids/txt_ids have 4 cols, not 3)."""
-        import openvino
 
         if batch_size == -1 or num_images_per_prompt == -1:
             batch_size = -1

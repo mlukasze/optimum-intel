@@ -8588,6 +8588,7 @@ class Lfm2MoeModelPatcher(Lfm2ModelPatcher):
 
 # ── FLUX.2-klein-4B (black-forest-labs/FLUX.2-klein-4B) ─────────────────────
 
+
 class Flux2KleinTextEncoderModelPatcher(ModelPatcher):
     """
     Model patcher for the Qwen3-based text encoder used in Flux2KleinPipeline.

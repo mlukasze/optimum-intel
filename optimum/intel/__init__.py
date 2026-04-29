@@ -232,8 +232,8 @@ if TYPE_CHECKING:
     else:
         from .openvino import (
             OVDiffusionPipeline,
-            OVFluxPipeline,
             OVFlux2KleinPipeline,
+            OVFluxPipeline,
             OVLatentConsistencyModelImg2ImgPipeline,
             OVLatentConsistencyModelPipeline,
             OVPipelineForImage2Image,
