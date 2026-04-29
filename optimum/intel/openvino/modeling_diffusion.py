@@ -126,6 +126,11 @@ if is_diffusers_version(">=", "0.35.0"):
 else:
     CacheMixin = object
 
+if is_diffusers_version(">=", "0.37.0"):
+    from diffusers import WanAnimatePipeline
+else:
+    WanAnimatePipeline = object
+
 DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER = "transformer"
 DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER = "text_encoder_3"
 
@@ -1663,6 +1668,23 @@ class OVLTXPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXPipel
     auto_model_class = LTXPipeline
 
 
+if is_diffusers_version(">=", "0.37.0"):
+
+    class OVWanAnimatePipeline(OVDiffusionPipeline, WanAnimatePipeline):
+        """OpenVINO-accelerated WanAnimatePipeline for image-to-video generation.
+
+        Wraps Wan2.2-Animate model (WanAnimatePipeline) to run the transformer,
+        VAE encoder/decoder, text encoder, and image encoder via OpenVINO.
+        """
+
+        main_input_name = "prompt"
+        export_feature = "image-to-video"
+        auto_model_class = WanAnimatePipeline
+
+else:
+    OVWanAnimatePipeline = None  # not available on older diffusers
+
+
 SUPPORTED_OV_PIPELINES = [
     OVStableDiffusionPipeline,
     OVStableDiffusionImg2ImgPipeline,
@@ -1711,10 +1733,15 @@ OV_INPAINT_PIPELINES_MAPPING = OrderedDict(
 )
 
 OV_TEXT2VIDEO_PIPELINES_MAPPING = OrderedDict()
+OV_IMAGE2VIDEO_PIPELINES_MAPPING = OrderedDict()
 
 if is_diffusers_version(">=", "0.32"):
     OV_TEXT2VIDEO_PIPELINES_MAPPING["ltx-video"] = OVLTXPipeline
     SUPPORTED_OV_PIPELINES.append(OVLTXPipeline)
+
+if is_diffusers_version(">=", "0.37.0") and OVWanAnimatePipeline is not None:
+    OV_IMAGE2VIDEO_PIPELINES_MAPPING["wan-animate"] = OVWanAnimatePipeline
+    SUPPORTED_OV_PIPELINES.append(OVWanAnimatePipeline)
 
 if is_diffusers_version(">=", "0.29.0"):
     SUPPORTED_OV_PIPELINES.extend(
@@ -1753,6 +1780,7 @@ SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_IMAGE2IMAGE_PIPELINES_MAPPING,
     OV_INPAINT_PIPELINES_MAPPING,
     OV_TEXT2VIDEO_PIPELINES_MAPPING,
+    OV_IMAGE2VIDEO_PIPELINES_MAPPING,
 ]
 
 
@@ -1823,3 +1851,9 @@ class OVPipelineForText2Video(OVPipelineForTask):
     auto_model_class = DiffusionPipeline
     ov_pipelines_mapping = OV_TEXT2VIDEO_PIPELINES_MAPPING
     export_feature = "text-to-video"
+
+
+class OVPipelineForImage2Video(OVPipelineForTask):
+    auto_model_class = DiffusionPipeline
+    ov_pipelines_mapping = OV_IMAGE2VIDEO_PIPELINES_MAPPING
+    export_feature = "image-to-video"

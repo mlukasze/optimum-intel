@@ -8584,3 +8584,101 @@ class Lfm2MoeModelPatcher(Lfm2ModelPatcher):
                 if isinstance(sparse_moe_block.experts, Lfm2MoeExperts):
                     lfm2_moe_experts = sparse_moe_block.experts
                     lfm2_moe_experts.forward = lfm2_moe_experts._orig_forward
+
+
+def _wan_animate_motion_encoder_forward_patched(self, face_image: torch.Tensor, channel_dim: int = 1) -> torch.Tensor:
+    """Patched WanAnimateMotionEncoder.forward that avoids torch.linalg.qr and torch.diag_embed.
+
+    Mathematical simplification:
+        Original: motion_vec = sum(diag_embed(motion_feat) @ Q.T, dim=1)
+        Simplified: motion_vec = motion_feat @ Q.T
+        where Q = linalg.qr(weight)[0] is precomputed at patch time.
+    """
+    if (face_image.shape[-2] != self.size) or (face_image.shape[-1] != self.size):
+        raise ValueError(
+            f"Face pixel values has resolution ({face_image.shape[-1]}, {face_image.shape[-2]}) but is expected"
+            f" to have resolution ({self.size}, {self.size})"
+        )
+    # Appearance encoding through convs
+    face_image = self.conv_in(face_image, channel_dim)
+    for block in self.res_blocks:
+        face_image = block(face_image, channel_dim)
+    face_image = self.conv_out(face_image, channel_dim)
+    motion_feat = face_image.squeeze(-1).squeeze(-1)
+
+    # Motion feature extraction
+    for linear_layer in self.motion_network:
+        motion_feat = linear_layer(motion_feat, channel_dim=channel_dim)
+
+    # Motion synthesis via precomputed QR (avoids linalg_qr + diag_embed)
+    # Equivalent to: sum(diag_embed(motion_feat) @ Q.T, dim=1) = motion_feat @ Q.T
+    original_motion_dtype = motion_feat.dtype
+    motion_feat = motion_feat.to(torch.float32)
+    Q_T = self._wan_Q_T_cached.to(device=motion_feat.device, dtype=torch.float32)
+    motion_vec = torch.matmul(motion_feat, Q_T)
+    motion_vec = motion_vec.to(dtype=original_motion_dtype)
+    return motion_vec
+
+
+class WanAnimateTransformerPatcher(ModelPatcher):
+    """Patcher for WanAnimateTransformer3DModel.
+
+    Patches WanAnimateMotionEncoder.forward to replace torch.linalg.qr + torch.diag_embed
+    with an equivalent computation using a precomputed Q matrix (OV-compatible ops only).
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        self._patched_motion_encoders = []
+        for module in self._model.modules():
+            # Look for WanAnimateMotionEncoder instances
+            cls_name = type(module).__name__
+            if cls_name == "WanAnimateMotionEncoder" and hasattr(module, "motion_synthesis_weight"):
+                # Precompute Q and cache Q.T as a buffer
+                weight = module.motion_synthesis_weight.data.float() + 1e-8
+                Q = torch.linalg.qr(weight)[0]  # computed once, not during tracing
+                Q_T = Q.T.contiguous()
+                module.register_buffer("_wan_Q_T_cached", Q_T, persistent=False)
+                # Save original forward and replace
+                module._wan_original_forward = module.forward
+                module.forward = types.MethodType(_wan_animate_motion_encoder_forward_patched, module)
+                self._patched_motion_encoders.append(module)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        for module in self._patched_motion_encoders:
+            if hasattr(module, "_wan_original_forward"):
+                module.forward = module._wan_original_forward
+                del module._wan_original_forward
+            if hasattr(module, "_wan_Q_T_cached"):
+                del module._wan_Q_T_cached
+        self._patched_motion_encoders = []
+
+
+class WanAnimateVAEPatcher(ModelPatcher):
+    """Patcher for AutoencoderKLWan (VAE encoder and decoder).
+
+    Patches WanUpsample modules to use 'nearest' instead of 'nearest-exact' mode,
+    which is not supported by OpenVINO's frontend.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        self._patched_upsamplers = []
+        for module in self._model.modules():
+            # WanUpsample is nn.Upsample subclass; detect it by mode
+            cls_name = type(module).__name__
+            if cls_name == "WanUpsample" and getattr(module, "mode", None) == "nearest-exact":
+                module._orig_mode = module.mode
+                module.mode = "nearest"
+                # Also need to update the underlying forward interpolation mode
+                # nn.Upsample stores mode as self.mode, forward uses F.interpolate
+                self._patched_upsamplers.append(module)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        for module in self._patched_upsamplers:
+            if hasattr(module, "_orig_mode"):
+                module.mode = module._orig_mode
+                del module._orig_mode
+        self._patched_upsamplers = []

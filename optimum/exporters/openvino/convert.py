@@ -1014,6 +1014,7 @@ def get_diffusion_models_for_export_ext(
     is_flux = pipeline.__class__.__name__.startswith("Flux")
     is_sana = pipeline.__class__.__name__.startswith("Sana")
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
+    is_wan_animate = pipeline.__class__.__name__.startswith("WanAnimate")
     is_sd = pipeline.__class__.__name__.startswith("StableDiffusion") and not is_sd3
     is_lcm = pipeline.__class__.__name__.startswith("LatentConsistencyModel")
 
@@ -1039,6 +1040,8 @@ def get_diffusion_models_for_export_ext(
         models_for_export = get_sana_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_ltx_video:
         models_for_export = get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype)
+    elif is_wan_animate:
+        models_for_export = get_wan_animate_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     else:
         raise ValueError(f"Unsupported pipeline type `{pipeline.__class__.__name__}` provided")
     return None, models_for_export
@@ -1111,6 +1114,132 @@ def get_ltx_video_models_for_export(pipeline, exporter, int_dtype, float_dtype):
     )
     vae_decoder_export_config = vae_config_constructor(
         vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_decoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
+
+    return models_for_export
+
+
+def get_wan_animate_models_for_export(pipeline, exporter, int_dtype, float_dtype):
+    """Build models_for_export dict for WanAnimatePipeline.
+
+    Exports:
+      - text_encoder  (UMT5 text encoder)
+      - image_encoder (CLIP vision encoder)
+      - transformer   (WanAnimateTransformer3DModel)
+      - vae_encoder   (AutoencoderKLWan encoder half)
+      - vae_decoder   (AutoencoderKLWan decoder half)
+    """
+    models_for_export = {}
+
+    # ── 1. Text encoder (UMT5) ────────────────────────────────────────────────
+    text_encoder = pipeline.text_encoder
+    text_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=text_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="feature-extraction",
+        model_type="t5-encoder-model",
+    )
+    text_encoder_export_config = text_encoder_config_constructor(
+        text_encoder.config,
+        int_dtype=int_dtype,
+        float_dtype=float_dtype,
+    )
+    text_encoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["text_encoder"] = (text_encoder, text_encoder_export_config)
+
+    # ── 2. Image encoder (CLIP vision) ────────────────────────────────────────
+    image_encoder = pipeline.image_encoder
+    image_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=image_encoder,
+        exporter=exporter,
+        library_name="transformers",
+        task="feature-extraction",
+        model_type="clip_vision_model",
+    )
+    image_encoder_export_config = image_encoder_config_constructor(
+        image_encoder.config,
+        int_dtype=int_dtype,
+        float_dtype=float_dtype,
+    )
+    models_for_export["image_encoder"] = (image_encoder, image_encoder_export_config)
+
+    # ── 3. Transformer (WanAnimateTransformer3DModel) ─────────────────────────
+    transformer = pipeline.transformer
+    # Patch forward: strip return_dict and unsupported kwargs; expose all required inputs
+    original_transformer_forward = transformer.forward
+
+    def wan_animate_transformer_forward(
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image,
+        pose_hidden_states,
+        face_pixel_values,
+    ):
+        return original_transformer_forward(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+            pose_hidden_states=pose_hidden_states,
+            face_pixel_values=face_pixel_values,
+            return_dict=False,
+        )
+
+    transformer.forward = wan_animate_transformer_forward
+
+    transformer_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=transformer,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="wan-animate-transformer",
+    )
+    transformer_export_config = transformer_config_constructor(
+        transformer.config,
+        int_dtype=int_dtype,
+        float_dtype=float_dtype,
+    )
+    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["transformer"] = (transformer, transformer_export_config)
+
+    # ── 4. VAE Encoder ────────────────────────────────────────────────────────
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: {
+        "latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters
+    }
+    vae_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="wan-animate-vae-encoder",
+    )
+    vae_encoder_export_config = vae_encoder_config_constructor(
+        vae_encoder.config,
+        int_dtype=int_dtype,
+        float_dtype=float_dtype,
+    )
+    vae_encoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
+    # ── 5. VAE Decoder ────────────────────────────────────────────────────────
+    vae_decoder = copy.deepcopy(pipeline.vae)
+    vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
+    vae_decoder_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_decoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="wan-animate-vae-decoder",
+    )
+    vae_decoder_export_config = vae_decoder_config_constructor(
+        vae_decoder.config,
+        int_dtype=int_dtype,
+        float_dtype=float_dtype,
     )
     vae_decoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
     models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)

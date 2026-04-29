@@ -206,6 +206,8 @@ from .model_patcher import (
     Qwen3VLVisionEmbMergerPatcher,
     QwenModelPatcher,
     SanaTextEncoderModelPatcher,
+    WanAnimateTransformerPatcher,
+    WanAnimateVAEPatcher,
     XverseModelPatcher,
     Zamba2ModelPatcher,
     _get_model_attribute,
@@ -313,6 +315,15 @@ def init_model_configs():
     if is_diffusers_available() and "text-to-video" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"] = {}
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"]["ltx-video"] = "LTXPipeline"
+    if is_diffusers_available() and "image-to-video" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["image-to-video"] = {}
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_LOADERS["image-to-video"] = "WanAnimatePipeline"
+    if is_diffusers_available() and "wan-animate" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS.get(
+        "image-to-video", {}
+    ):
+        if "image-to-video" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
+            TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["image-to-video"] = {}
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["image-to-video"]["wan-animate"] = "WanAnimatePipeline"
 
     supported_model_types = [
         "_SUPPORTED_MODEL_TYPE",
@@ -5559,3 +5570,210 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
 class LFM2MoeOpenVINOConfig(LFM2OpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "5.0"
     _MODEL_PATCHER = Lfm2MoeModelPatcher
+
+
+# ─── WanAnimate (Wan2.2-Animate video generation) ──────────────────────────────
+
+class WanAnimateTransformerDummyInputGenerator(DummyVisionInputGenerator):
+    """Generates dummy inputs for the WanAnimateTransformer3DModel."""
+
+    SUPPORTED_INPUT_NAMES = (
+        "hidden_states",
+        "timestep",
+        "encoder_hidden_states",
+        "encoder_hidden_states_image",
+        "pose_hidden_states",
+        "face_pixel_values",
+    )
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = 8,
+        height: int = 8,
+        num_frames: int = 2,
+        seq_length: int = 10,
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height, **kwargs)
+        self.num_frames = num_frames
+        self.seq_length = seq_length
+        # latent_channels = (in_channels - 4) // 2, default 16
+        self.latent_channels = getattr(normalized_config.config, "latent_channels", 16)
+        self.in_channels = getattr(normalized_config.config, "in_channels", 36)
+        self.text_dim = getattr(normalized_config.config, "text_dim", 4096)
+        self.image_dim = getattr(normalized_config.config, "image_dim", 1280)
+        self.motion_encoder_size = getattr(normalized_config.config, "motion_encoder_size", 512)
+        # Compute number of image patches: (224 // 32)^2 + 1 = 50 for standard CLIP
+        self.num_image_patches = 50
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        import torch
+
+        if input_name == "hidden_states":
+            # (B, 2C+4, T+1, H, W) — T video frames + 1 reference frame
+            return self.random_float_tensor(
+                [self.batch_size, self.in_channels, self.num_frames + 1, self.height, self.width],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "timestep":
+            return torch.randint(1, 1000, (self.batch_size,), dtype=torch.long)
+        if input_name == "encoder_hidden_states":
+            # (B, seq_len, text_dim)
+            return self.random_float_tensor(
+                [self.batch_size, self.seq_length, self.text_dim],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "encoder_hidden_states_image":
+            # (B, num_patches, image_dim) — CLIP image features
+            return self.random_float_tensor(
+                [self.batch_size, self.num_image_patches, self.image_dim],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "pose_hidden_states":
+            # (B, latent_channels, T, H, W) — one less frame than hidden_states
+            return self.random_float_tensor(
+                [self.batch_size, self.latent_channels, self.num_frames, self.height, self.width],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "face_pixel_values":
+            # (B, 3, T, motion_encoder_size, motion_encoder_size)
+            return self.random_float_tensor(
+                [self.batch_size, 3, self.num_frames, self.motion_encoder_size, self.motion_encoder_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+class WanAnimateVAEDummyInputGenerator(DummyVisionInputGenerator):
+    """Generates dummy inputs for the AutoencoderKLWan encoder/decoder."""
+
+    SUPPORTED_INPUT_NAMES = ("sample", "latent_sample")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"],
+        height: int = DEFAULT_DUMMY_SHAPES["height"],
+        num_frames: int = 2,
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height, **kwargs)
+        self.num_frames = num_frames
+        # Extract z_dim in __init__ since DummyVisionInputGenerator doesn't save normalized_config
+        self.z_dim = getattr(normalized_config.config, "z_dim", 16)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "sample":
+            # (B, 3, T, H, W) — RGB video
+            return self.random_float_tensor(
+                [self.batch_size, 3, self.num_frames, self.height, self.width],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "latent_sample":
+            # (B, z_dim, T_latent, H_latent, W_latent)
+            return self.random_float_tensor(
+                [self.batch_size, self.z_dim, self.num_frames, self.height // 8, self.width // 8],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
+@register_in_tasks_manager("wan-animate-transformer", *["semantic-segmentation"], library_name="diffusers")
+class WanAnimateTransformerOpenVINOConfig(SanaTransformerOpenVINOConfig):
+    """OpenVINO export config for WanAnimateTransformer3DModel."""
+
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig.with_args(
+        num_channels="in_channels",
+        vocab_size="attention_head_dim",
+        allow_new=True,
+    )
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (WanAnimateTransformerDummyInputGenerator,)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "hidden_states": {0: "batch_size", 2: "num_frames_plus_one", 3: "latent_height", 4: "latent_width"},
+            "timestep": {0: "batch_size"},
+            "encoder_hidden_states": {0: "batch_size", 1: "text_sequence_length"},
+            "encoder_hidden_states_image": {0: "batch_size", 1: "num_image_patches"},
+            "pose_hidden_states": {0: "batch_size", 2: "num_frames", 3: "latent_height", 4: "latent_width"},
+            "face_pixel_values": {0: "batch_size", 2: "num_frames", 3: "face_size", 4: "face_size"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "out_sample": {0: "batch_size", 2: "num_frames", 3: "latent_height", 4: "latent_width"},
+        }
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        # Skip VisionOnnxConfig.generate_dummy_inputs which does encoder_hidden_states[0]
+        # and UNetOnnxConfig.generate_dummy_inputs which wraps encoder_hidden_states in a list.
+        # Use the base ExporterConfig.generate_dummy_inputs instead.
+        from optimum.exporters.base import ExporterConfig
+        return ExporterConfig.generate_dummy_inputs(self, framework=framework, **kwargs)
+
+    def patch_model_for_export(self, model, model_kwargs=None):
+        model_kwargs = model_kwargs or {}
+        return WanAnimateTransformerPatcher(self, model, model_kwargs)
+
+
+@register_in_tasks_manager("wan-animate-vae-encoder", *["semantic-segmentation"], library_name="diffusers")
+class WanAnimateVaeEncoderOpenVINOConfig(VaeEncoderOnnxConfig):
+    """OpenVINO export config for AutoencoderKLWan encoder."""
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (WanAnimateVAEDummyInputGenerator,)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_parameters": {0: "batch_size", 2: "num_frames_latent", 3: "height_latent", 4: "width_latent"},
+        }
+
+    def patch_model_for_export(self, model, model_kwargs=None):
+        model_kwargs = model_kwargs or {}
+        return WanAnimateVAEPatcher(self, model, model_kwargs)
+
+
+@register_in_tasks_manager("wan-animate-vae-decoder", *["semantic-segmentation"], library_name="diffusers")
+class WanAnimateVaeDecoderOpenVINOConfig(VaeDecoderOnnxConfig):
+    """OpenVINO export config for AutoencoderKLWan decoder."""
+
+    DUMMY_INPUT_GENERATOR_CLASSES = (WanAnimateVAEDummyInputGenerator,)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "latent_sample": {0: "batch_size", 2: "num_frames_latent", 3: "height_latent", 4: "width_latent"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "sample": {0: "batch_size", 2: "num_frames", 3: "height", 4: "width"},
+        }
+
+    def patch_model_for_export(self, model, model_kwargs=None):
+        model_kwargs = model_kwargs or {}
+        return WanAnimateVAEPatcher(self, model, model_kwargs)
