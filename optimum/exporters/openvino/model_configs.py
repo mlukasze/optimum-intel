@@ -213,6 +213,7 @@ from .model_patcher import (
     _get_model_attribute,
 )
 
+
 COMMON_TEXT_TASKS = [
     "feature-extraction",
     "fill-mask",
