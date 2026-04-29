@@ -8584,3 +8584,42 @@ class Lfm2MoeModelPatcher(Lfm2ModelPatcher):
                 if isinstance(sparse_moe_block.experts, Lfm2MoeExperts):
                     lfm2_moe_experts = sparse_moe_block.experts
                     lfm2_moe_experts.forward = lfm2_moe_experts._orig_forward
+
+
+# ── FLUX.2-klein-4B (black-forest-labs/FLUX.2-klein-4B) ─────────────────────
+
+class Flux2KleinTextEncoderModelPatcher(ModelPatcher):
+    """
+    Model patcher for the Qwen3-based text encoder used in Flux2KleinPipeline.
+
+    Flux2KleinPipeline._get_qwen3_prompt_embeds stacks hidden states from
+    layers [9, 18, 27] and reshapes to (batch, seq_len, 3 * hidden_size).
+    This patcher wraps forward to perform that same operation so the exported
+    OV model returns a single ``last_hidden_state`` tensor of shape
+    (batch, seq_len, joint_attention_dim) matching what the pipeline expects.
+    """
+
+    # Indices of the three Qwen3 hidden-state layers used by Flux2KleinPipeline.
+    _LAYERS: tuple = (9, 18, 27)
+
+    def __init__(self, config, model, model_kwargs=None):
+        super().__init__(config, model, model_kwargs)
+        _orig_forward = self.orig_forward
+        layers = self._LAYERS
+
+        @functools.wraps(_orig_forward)
+        def patched_forward(input_ids, attention_mask):
+            out = _orig_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            # Stack requested hidden-state layers: (batch, 3, seq_len, hidden_size)
+            stacked = torch.stack([out.hidden_states[k] for k in layers], dim=1)
+            batch, num_layers, seq_len, hidden_dim = stacked.shape
+            # Reshape to (batch, seq_len, 3 * hidden_size) = (batch, seq_len, joint_attention_dim)
+            prompt_embeds = stacked.permute(0, 2, 1, 3).reshape(batch, seq_len, num_layers * hidden_dim)
+            return {"last_hidden_state": prompt_embeds}
+
+        self.patched_forward = patched_forward

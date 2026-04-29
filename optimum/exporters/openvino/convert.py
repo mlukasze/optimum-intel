@@ -1011,7 +1011,9 @@ def get_diffusion_models_for_export_ext(
 ):
     is_sdxl = pipeline.__class__.__name__.startswith("StableDiffusionXL")
     is_sd3 = pipeline.__class__.__name__.startswith("StableDiffusion3")
-    is_flux = pipeline.__class__.__name__.startswith("Flux")
+    # Flux2Klein must be checked before the generic Flux check (it also starts with "Flux")
+    is_flux2_klein = pipeline.__class__.__name__ == "Flux2KleinPipeline"
+    is_flux = pipeline.__class__.__name__.startswith("Flux") and not is_flux2_klein
     is_sana = pipeline.__class__.__name__.startswith("Sana")
     is_ltx_video = pipeline.__class__.__name__.startswith("LTX")
     is_sd = pipeline.__class__.__name__.startswith("StableDiffusion") and not is_sd3
@@ -1033,6 +1035,8 @@ def get_diffusion_models_for_export_ext(
 
     elif is_sd3:
         models_for_export = get_sd3_models_for_export(pipeline, exporter, int_dtype, float_dtype)
+    elif is_flux2_klein:
+        models_for_export = get_flux2_klein_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_flux:
         models_for_export = get_flux_models_for_export(pipeline, exporter, int_dtype, float_dtype)
     elif is_sana:
@@ -1279,6 +1283,88 @@ def get_sd3_models_for_export(pipeline, exporter, int_dtype, float_dtype):
         )
         export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
         models_for_export["text_encoder_3"] = (text_encoder_3, export_config)
+
+    return models_for_export
+
+
+def get_flux2_klein_models_for_export(pipeline, exporter, int_dtype, float_dtype):
+    """Build models-for-export dict for Flux2KleinPipeline.
+
+    Sub-models exported:
+    - ``text_encoder``:  Qwen3ForCausalLM → "qwen3-flux2-klein-text-encoder" config
+                         (Flux2KleinTextEncoderModelPatcher stacks hidden states [9,18,27])
+    - ``transformer``:   Flux2Transformer2DModel → "flux2-transformer-2d" config
+    - ``vae_encoder``:   AutoencoderKLFlux2 encoder → "vae-encoder" config
+    - ``vae_decoder``:   AutoencoderKLFlux2 decoder → "vae-decoder" config
+    """
+    models_for_export = {}
+
+    # ── Text Encoder (Qwen3) ────────────────────────────────────────────────
+    text_encoder = pipeline.text_encoder
+    text_encoder_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=text_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="feature-extraction",
+        model_type="qwen3-flux2-klein-text-encoder",
+    )
+    text_encoder_export_config = text_encoder_config_constructor(
+        text_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    models_for_export["text_encoder"] = (text_encoder, text_encoder_export_config)
+
+    # ── Transformer (Flux2Transformer2DModel) ────────────────────────────────
+    transformer = pipeline.transformer
+    export_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=transformer,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="flux2-transformer-2d",
+    )
+    transformer_export_config = export_config_constructor(
+        transformer.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["transformer"] = (transformer, transformer_export_config)
+
+    # ── VAE Encoder ─────────────────────────────────────────────────────────
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: {"latent_parameters": vae_encoder.encode(x=sample)["latent_dist"].parameters}
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="vae-encoder",
+    )
+    vae_encoder_export_config = vae_config_constructor(
+        vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_encoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
+    # ── VAE Decoder ─────────────────────────────────────────────────────────
+    vae_decoder = copy.deepcopy(pipeline.vae)
+    vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)
+    # Persist BatchNorm running stats in config so they survive the OV export.
+    # AutoencoderKLFlux2._internal_dict is a FrozenDict; build a mutable copy.
+    vae_decoder_dict = dict(vae_decoder._internal_dict)
+    vae_decoder_dict["bn_running_mean"] = vae_decoder.bn.running_mean.tolist()
+    vae_decoder_dict["bn_running_var"] = vae_decoder.bn.running_var.tolist()
+    vae_decoder._internal_dict = type(vae_decoder._internal_dict)(vae_decoder_dict)
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_decoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="vae-decoder",
+    )
+    vae_decoder_export_config = vae_config_constructor(
+        vae_decoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_decoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_decoder"] = (vae_decoder, vae_decoder_export_config)
 
     return models_for_export
 

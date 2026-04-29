@@ -108,6 +108,7 @@ except OptionalDependencyNotAvailable:
             "OVFluxImg2ImgPipeline",
             "OVFluxInpaintPipeline",
             "OVFluxFillPipeline",
+            "OVFlux2KleinPipeline",
             "OVSanaPipeline",
             "OVPipelineForImage2Image",
             "OVPipelineForText2Image",
@@ -135,6 +136,7 @@ else:
             "OVFluxImg2ImgPipeline",
             "OVFluxInpaintPipeline",
             "OVFluxFillPipeline",
+            "OVFlux2KleinPipeline",
             "OVSanaPipeline",
             "OVPipelineForImage2Image",
             "OVPipelineForText2Image",
@@ -231,6 +233,7 @@ if TYPE_CHECKING:
         from .openvino import (
             OVDiffusionPipeline,
             OVFluxPipeline,
+            OVFlux2KleinPipeline,
             OVLatentConsistencyModelImg2ImgPipeline,
             OVLatentConsistencyModelPipeline,
             OVPipelineForImage2Image,

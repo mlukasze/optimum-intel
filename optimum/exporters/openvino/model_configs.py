@@ -150,6 +150,7 @@ from .model_patcher import (
     DeciLMModelPatcher,
     DeepseekPatcher,
     FalconModelPatcher,
+    Flux2KleinTextEncoderModelPatcher,
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
     Gemma3LMModelPatcher,
@@ -313,6 +314,11 @@ def init_model_configs():
     if is_diffusers_available() and "text-to-video" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"] = {}
         TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-video"]["ltx-video"] = "LTXPipeline"
+    # Register flux2-klein pipeline for text-to-image export
+    if is_diffusers_available():
+        if "text-to-image" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS:
+            TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-image"] = {}
+        TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS["text-to-image"]["flux2-klein"] = "Flux2KleinPipeline"
 
     supported_model_types = [
         "_SUPPORTED_MODEL_TYPE",
@@ -5559,3 +5565,129 @@ class Qwen3NextOpenVINOConfig(Qwen3OpenVINOConfig):
 class LFM2MoeOpenVINOConfig(LFM2OpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "5.0"
     _MODEL_PATCHER = Lfm2MoeModelPatcher
+
+
+# ── FLUX.2-klein-4B (black-forest-labs/FLUX.2-klein-4B) ─────────────────────
+
+if is_diffusers_available():
+
+    @register_in_tasks_manager("qwen3-flux2-klein-text-encoder", *["feature-extraction"], library_name="diffusers")
+    class Flux2KleinTextEncoderOpenVINOConfig(CLIPTextOpenVINOConfig):
+        """
+        Export config for the Qwen3-based text encoder used in Flux2KleinPipeline.
+
+        The patched forward (via Flux2KleinTextEncoderModelPatcher) stacks hidden
+        states from layers [9, 18, 27] and returns them concatenated as
+        last_hidden_state of shape (batch, seq_len, joint_attention_dim).
+        """
+
+        _MODEL_PATCHER = Flux2KleinTextEncoderModelPatcher
+
+        @property
+        def inputs(self) -> Dict[str, Dict[int, str]]:
+            return {
+                "input_ids": {0: "batch_size", 1: "sequence_length"},
+                "attention_mask": {0: "batch_size", 1: "sequence_length"},
+            }
+
+        @property
+        def outputs(self) -> Dict[str, Dict[int, str]]:
+            # Output is (batch, seq_len, joint_attention_dim = 3 * hidden_size)
+            return {
+                "last_hidden_state": {0: "batch_size", 1: "sequence_length"},
+            }
+
+    class DummyFlux2KleinTransformerInputGenerator(DummyVisionInputGenerator):
+        """Generates dummy inputs for Flux2Transformer2DModel export."""
+
+        SUPPORTED_INPUT_NAMES = (
+            "pixel_values",
+            "pixel_mask",
+            "sample",
+            "latent_sample",
+            "hidden_states",
+            "img_ids",
+        )
+
+        def __init__(
+            self,
+            task: str,
+            normalized_config: NormalizedVisionConfig,
+            batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+            num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+            # Use smaller image to reduce memory usage during conversion
+            width: int = DEFAULT_DUMMY_SHAPES["width"] // 4,
+            height: int = DEFAULT_DUMMY_SHAPES["height"] // 4,
+            **kwargs,
+        ):
+            super().__init__(task, normalized_config, batch_size, num_channels, width, height, **kwargs)
+            if getattr(normalized_config, "in_channels", None):
+                self.num_channels = normalized_config.in_channels
+
+        def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+            if input_name in ["hidden_states", "sample"]:
+                # Flux2: packed latent shape is (batch, H*W, in_channels)
+                shape = [self.batch_size, self.height * self.width, self.num_channels]
+                return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+            if input_name == "img_ids":
+                # Flux2 uses 4D position IDs: (B, H*W, 4)
+                return self.random_int_tensor(
+                    [self.batch_size, self.height * self.width, 4],
+                    min_value=0,
+                    max_value=min(self.height, self.width),
+                    framework=framework,
+                    dtype=float_dtype,
+                )
+            return super().generate(input_name, framework, int_dtype, float_dtype)
+
+    class DummyFlux2KleinTextInputGenerator(DummySeq2SeqDecoderTextInputGenerator):
+        """Generates dummy text inputs for Flux2Transformer2DModel export."""
+
+        SUPPORTED_INPUT_NAMES = (
+            "decoder_input_ids",
+            "decoder_attention_mask",
+            "encoder_outputs",
+            "encoder_hidden_states",
+            "txt_ids",
+        )
+
+        def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+            if input_name == "txt_ids":
+                import torch
+
+                # Flux2 uses 4D text position IDs: (B, T, 4)
+                dtype = DTYPE_MAPPER.pt(float_dtype)
+                return torch.full([self.batch_size, self.sequence_length, 4], 0, dtype=dtype)
+            return super().generate(input_name, framework, int_dtype, float_dtype)
+
+    @register_in_tasks_manager("flux2-transformer-2d", *["semantic-segmentation"], library_name="diffusers")
+    class Flux2TransformerOpenVINOConfig(SD3TransformerOpenVINOConfig):
+        """
+        Export config for Flux2Transformer2DModel (used by FLUX.2-klein-4B).
+
+        Key differences from FluxTransformerOpenVINOConfig (FLUX.1):
+        - No ``pooled_projections`` input.
+        - ``img_ids`` and ``txt_ids`` are 4D (T, H, W, L) shape [B, S, 4].
+        - ``hidden_states`` is unpacked: shape (batch, H*W, in_channels).
+        """
+
+        DUMMY_INPUT_GENERATOR_CLASSES = (
+            DummyTransformerTimestpsInputGenerator,
+            DummyFlux2KleinTransformerInputGenerator,
+            DummyFlux2KleinTextInputGenerator,
+        )
+        _MODEL_PATCHER = FluxTransfromerModelPatcher
+
+        @property
+        def inputs(self):
+            common_inputs = super().inputs
+            # Flux2 has no pooled_projections
+            common_inputs.pop("pooled_projections", None)
+            common_inputs.pop("sample", None)
+            # Packed image latents: (batch, H*W, in_channels)
+            common_inputs["hidden_states"] = {0: "batch_size", 1: "packed_height_width"}
+            # 4D text position IDs: (batch, text_seq_len, 4)
+            common_inputs["txt_ids"] = {0: "batch_size", 1: "sequence_length"}
+            # 4D image position IDs: (batch, img_seq_len, 4)
+            common_inputs["img_ids"] = {0: "batch_size", 1: "packed_height_width"}
+            return common_inputs
