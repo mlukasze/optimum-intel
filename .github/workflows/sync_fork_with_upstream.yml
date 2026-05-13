@@ -19,12 +19,30 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           response="$(
-          curl --silent --show-error --fail-with-body \
+          curl --silent --show-error \
+            --write-out "\n%{http_code}" \
             -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "${{ github.api_url }}/repos/${{ github.repository }}/merge-upstream" \
             -d "{\"branch\":\"${DEFAULT_BRANCH}\"}"
           )"
-          echo "Sync API response:"
-          echo "${response}"
+          http_code="$(echo "${response}" | tail -n1)"
+          body="$(echo "${response}" | sed '$d')"
+
+          echo "Sync API status: ${http_code}"
+          [ -n "${body}" ] && echo "${body}"
+
+          case "${http_code}" in
+            200|201|204)
+              echo "Fork sync completed."
+              ;;
+            409)
+              echo "Fork sync failed due to merge conflicts."
+              exit 1
+              ;;
+            *)
+              echo "Fork sync failed with unexpected status code: ${http_code}"
+              exit 1
+              ;;
+          esac
