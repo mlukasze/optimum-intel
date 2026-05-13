@@ -1,0 +1,26 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: "0 14 * * *" # Daily around 16:00 UTC+2
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync default branch from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          curl --silent --show-error --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/merge-upstream" \
+            -d "{\"branch\":\"${DEFAULT_BRANCH}\"}"
