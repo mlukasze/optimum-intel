@@ -2,7 +2,7 @@ name: Sync fork with upstream
 
 on:
   schedule:
-    - cron: "0 14 * * *" # Daily around 16:00 UTC+2
+    - cron: "0 14 * * *" # Daily at 14:00 UTC (~16:00 UTC+2)
   workflow_dispatch:
 
 permissions:
@@ -18,9 +18,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          response="$(
           curl --silent --show-error --fail-with-body \
             -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "${{ github.api_url }}/repos/${{ github.repository }}/merge-upstream" \
             -d "{\"branch\":\"${DEFAULT_BRANCH}\"}"
+          )"
+          echo "Sync API response:"
+          echo "${response}"
