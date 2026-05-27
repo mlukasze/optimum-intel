@@ -73,6 +73,7 @@ from optimum.exporters.onnx.model_configs import (
     MobileViTOnnxConfig,
     MPNetOnnxConfig,
     MPTOnnxConfig,
+    NemotronOnnxConfig,
     NystromformerOnnxConfig,
     Olmo2OnnxConfig,
     OPTOnnxConfig,
@@ -195,6 +196,7 @@ from .model_patcher import (
     MiniCPMVResamplerModelPatcher,
     MistralModelPatcher,
     MixtralModelPatcher,
+    NemotronLabsDiffusionVLMLanguageModelPatcher,
     MPTModelPatcher,
     OVDecoderModelPatcher,
     OVSeq2SeqModelPatcher,
@@ -267,6 +269,34 @@ def _warn_potential_accuracy_issue_ov_2026_1(model_type: str, min_transformers_v
 
 if TYPE_CHECKING:
     from transformers.modeling_utils import PreTrainedModel  # noqa: F811
+
+
+class NemotronLabsDiffusionModelLoader:
+    """
+    Custom model loader for NemotronLabsDiffusion models.
+    Wraps AutoModelForCausalLM and handles the custom config registration.
+    """
+    
+    @staticmethod
+    def from_pretrained(model_name_or_path, **kwargs):
+        """Load NemotronLabsDiffusion model with proper config registration."""
+        from transformers import AutoModelForCausalLM
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from transformers import AutoConfig
+        
+        # Register the config if not already registered
+        if 'nemotron_labs_diffusion' not in CONFIG_MAPPING:
+            try:
+                config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+                CONFIG_MAPPING._extra_content['nemotron_labs_diffusion'] = config.__class__
+            except Exception:
+                pass  # If registration fails, continue anyway
+        
+        # Ensure trust_remote_code is enabled
+        kwargs['trust_remote_code'] = True
+        
+        # Load the model
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
 
 
 def init_model_configs():
@@ -343,6 +373,38 @@ def init_model_configs():
         TasksManager._CUSTOM_CLASSES[("pt", "qwen3_asr", "automatic-speech-recognition-with-past")] = (
             "transformers",
             "AutoModel",
+        )
+        # Register nemotron_labs_diffusion to use custom loader class
+        # The model has a custom config that isn't in transformers' registry,
+        # so we need a custom loader that registers it before loading
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion", "feature-extraction")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
+        )
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion", "feature-extraction-with-past")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
+        )
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion", "text-generation")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
+        )
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion", "text-generation-with-past")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
+        )
+
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion_vlm", "image-text-to-text")] = (
+            "transformers",
+            "AutoModelForCausalLM",
+        )
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion_vlm", "text-generation")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
+        )
+        TasksManager._CUSTOM_CLASSES[("pt", "nemotron_labs_diffusion_vlm", "text-generation-with-past")] = (
+            "optimum.exporters.openvino.model_configs",
+            "NemotronLabsDiffusionModelLoader",
         )
 
     if is_diffusers_available() and "fill" not in TasksManager._DIFFUSERS_TASKS_TO_MODEL_LOADERS:
@@ -934,6 +996,30 @@ class LlamaOpenVINOConfig(LlamaOnnxConfig):
         if self.eagle3:
             common_outputs["d2t"] = {0: "vocab_size"}
         return common_outputs
+
+
+@register_in_tasks_manager(
+    "nemotron",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+    ],
+    library_name="transformers",
+)
+@register_in_tasks_manager(
+    "nemotron_labs_diffusion",
+    *[
+        "feature-extraction",
+        "feature-extraction-with-past",
+        "text-generation",
+        "text-generation-with-past",
+    ],
+    library_name="transformers",
+)
+class NemotronOpenVINOConfig(NemotronOnnxConfig):
+    _MODEL_PATCHER = OVDecoderModelPatcher
 
 
 @register_in_tasks_manager(
@@ -2048,6 +2134,21 @@ class VLMConfigBehavior(str, enum.Enum):
     LANGUAGE = "language"
 
 
+class DummyNemotronLabsDiffusionVLMInputGenerator(DummyVisionInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("pixel_values", "image_sizes")
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "image_sizes":
+            import torch
+
+            return torch.tensor(
+                [[self.height, self.width] for _ in range(self.batch_size)],
+                dtype=DTYPE_MAPPER.pt(int_dtype),
+            )
+
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
 class BaseVLMOpenVINOConfig(OnnxConfig):
     SUPPORTED_BEHAVIORS = [model_type.value for model_type in VLMConfigBehavior]
     NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
@@ -2179,6 +2280,91 @@ class LlavaOpenVINOConfig(BaseVLMOpenVINOConfig):
 
     def generate_dummy_inputs(self, framework: str = "pt", **kwargs) -> Dict:
         if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS and self._config.model_type == "pixtral":
+            kwargs["batch_size"] = 1
+        return super().generate_dummy_inputs(framework, **kwargs)
+
+
+@register_in_tasks_manager("nemotron_labs_diffusion_vlm", *["image-text-to-text"], library_name="transformers")
+class NemotronLabsDiffusionVLMOpenVINOConfig(BaseVLMOpenVINOConfig):
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyNemotronLabsDiffusionVLMInputGenerator,)
+    _OV_2026_1_MODEL_TYPE = "nemotron_labs_diffusion_vlm"
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        behavior: VLMConfigBehavior = VLMConfigBehavior.VISION_EMBEDDINGS,
+        preprocessors: Optional[List[Any]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            behavior=behavior,
+            preprocessors=preprocessors,
+            **kwargs,
+        )
+        self._orig_config = config
+        if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS and hasattr(config, "vision_config"):
+            vision_config = config.vision_config
+            if isinstance(vision_config, dict):
+                vision_config = PretrainedConfig(**vision_config)
+            self._config = vision_config
+            self._normalized_config = self.NORMALIZED_CONFIG_CLASS(self._config)
+        _warn_potential_accuracy_issue_ov_2026_1(self._OV_2026_1_MODEL_TYPE, min_transformers_version="5.0")
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior != VLMConfigBehavior.VISION_EMBEDDINGS:
+            return super().inputs
+        return {
+            "pixel_values": {0: "batch_size", 2: "height", 3: "width"},
+            "image_sizes": {0: "batch_size"},
+        }
+
+    def with_behavior(
+        self,
+        behavior: Union[str, VLMConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, VLMConfigBehavior):
+            behavior = VLMConfigBehavior(behavior)
+
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "nemotron_labs_diffusion", self._orig_config, self.int_dtype, self.float_dtype
+            )
+
+        if behavior == VLMConfigBehavior.LANGUAGE:
+            return get_vlm_text_generation_config(
+                "nemotron_labs_diffusion",
+                self._orig_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=NemotronLabsDiffusionVLMLanguageModelPatcher,
+            )
+
+        return super().with_behavior(behavior)
+
+    def get_model_for_behavior(self, model, behavior: Union[str, VLMConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, VLMConfigBehavior):
+            behavior = VLMConfigBehavior(behavior)
+
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            text_embedding = model.get_input_embeddings()
+            text_embedding.config = model.config
+            return text_embedding
+
+        if behavior == VLMConfigBehavior.LANGUAGE:
+            return model
+
+        return super().get_model_for_behavior(model, behavior)
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs) -> Dict:
+        if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS and getattr(self._config, "model_type", None) == "pixtral":
             kwargs["batch_size"] = 1
         return super().generate_dummy_inputs(framework, **kwargs)
 

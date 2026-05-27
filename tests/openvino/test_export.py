@@ -29,6 +29,7 @@ from utils_tests import (
 from optimum.exporters.onnx.constants import SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED
 from optimum.exporters.onnx.model_configs import BertOnnxConfig
 from optimum.exporters.openvino import export_from_model, main_export
+from optimum.exporters.openvino.model_configs import NemotronLabsDiffusionVLMOpenVINOConfig, VLMConfigBehavior
 from optimum.exporters.tasks import TasksManager
 from optimum.intel import (
     OVFluxPipeline,
@@ -365,6 +366,28 @@ class ExportModelTest(unittest.TestCase):
             only_onnx = onnx_architectures - openvino_architectures
             if len(only_onnx) > 0:
                 logger.warning(f"The following architectures export {only_onnx} is supported by ONNX but not OpenVINO")
+
+
+class NemotronLabsDiffusionVLMExportConfigTest(unittest.TestCase):
+    def test_nemotron_labs_diffusion_vlm_export_config(self):
+        model_id = "nvidia/Nemotron-Labs-Diffusion-VLM-8B"
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+        self.assertEqual(config.model_type, "nemotron_labs_diffusion_vlm")
+        supported_tasks = TasksManager.get_supported_tasks_for_model_type(
+            "nemotron_labs_diffusion_vlm", exporter="openvino", library_name="transformers"
+        )
+        self.assertIn("image-text-to-text", supported_tasks)
+
+        export_config = NemotronLabsDiffusionVLMOpenVINOConfig(config=config, task="image-text-to-text")
+        self.assertIn("pixel_values", export_config.inputs)
+        self.assertIn("image_sizes", export_config.inputs)
+
+        text_embeddings_config = export_config.with_behavior(VLMConfigBehavior.TEXT_EMBEDDINGS)
+        language_config = export_config.with_behavior(VLMConfigBehavior.LANGUAGE)
+
+        self.assertIn("input_ids", text_embeddings_config.inputs)
+        self.assertIn("inputs_embeds", language_config.inputs)
 
 
 class CustomExportModelTest(unittest.TestCase):
