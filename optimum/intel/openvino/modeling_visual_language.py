@@ -5818,9 +5818,14 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM, Qwen3_5Model, Qwen3_5Visio
         return super().generate(*args, **kwargs)
 
 
+class _OVNemotronLabsDiffusionVLMForCausalLM(_OVIdefics3ForCausalLM):
+    """Nemotron Labs Diffusion VLM model for OpenVINO."""
+
+
 MODEL_TYPE_TO_CLS_MAPPING = {
     "llava": _OVLlavaForCausalLM,
     "llava_next": _OVLlavaNextForCausalLM,
+    "nemotron_labs_diffusion_vlm": _OVNemotronLabsDiffusionVLMForCausalLM,
     "llava_next_video": _OVLlavaNextVideoForCausalLM,
     "minicpmv": _OVMiniCPMVForCausalLM,
     "llava-qwen2": _OVNanoLlavaForCausalLM,
