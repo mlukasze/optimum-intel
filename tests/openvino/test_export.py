@@ -127,6 +127,7 @@ class ExportModelTest(unittest.TestCase):
         "qwen3_omni_moe": OVModelForMultimodalLM,
         "muse_glimmer": OVModelForVisualCausalLM,
         "deepseek_ocr2": OVModelForVisualCausalLM,
+        "molmo2": OVModelForVisualCausalLM,
     }
 
     # filter architectures depending on min/max transformers supported versions
@@ -180,7 +181,7 @@ class ExportModelTest(unittest.TestCase):
             model_class = TasksManager.get_model_class_for_task(task, library=library_name)
             model = model_class(f"hf_hub:{model_name}", pretrained=True, exportable=True)
             TasksManager.standardize_model_attributes(model_name, model, library_name=library_name)
-        elif model_type in ["llava", "videochat_flash_qwen"]:
+        elif model_type in ["llava", "videochat_flash_qwen", "molmo2"]:
             model = MODEL_TYPE_TO_CLS_MAPPING[model_type].auto_model_class.from_pretrained(
                 model_name, **loading_kwargs
             )
