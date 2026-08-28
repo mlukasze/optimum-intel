@@ -1307,12 +1307,8 @@ class OVModelForImageClassificationIntegrationTest(unittest.TestCase):
 class OVModelForObjectDetectionIntegrationTest(unittest.TestCase):
     SUPPORTED_ARCHITECTURES = ()
 
-    if is_transformers_version(">=", "5.8.0"):
+    if is_transformers_version(">=", "5.10.0"):
         SUPPORTED_ARCHITECTURES += ("rf_detr",)
-
-    # RF-DETR backbone requires the spatial resolution to be a multiple of
-    # patch_size * num_windows (14 * 4 = 56 for the real checkpoints).
-    IMAGE_SIZE = 56
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_compare_to_transformers(self, model_arch):
@@ -1323,16 +1319,15 @@ class OVModelForObjectDetectionIntegrationTest(unittest.TestCase):
         )
         self.assertIsInstance(ov_model.config, PretrainedConfig)
         set_seed(SEED)
-        transformers_model = AutoModelForObjectDetection.from_pretrained(model_id)
+
+        transformers_model = AutoModelForObjectDetection.from_pretrained(model_id, attn_implementation="eager")
         transformers_model.eval()
-
-        pixel_values = torch.rand(1, 3, self.IMAGE_SIZE, self.IMAGE_SIZE)
-        pixel_mask = torch.ones(1, self.IMAGE_SIZE, self.IMAGE_SIZE, dtype=torch.int64)
-
+        image_size = transformers_model.config.backbone_config.image_size
+        pixel_values = torch.rand(1, 3, image_size, image_size)
+        pixel_mask = torch.ones(1, image_size, image_size, dtype=torch.int64)
         with torch.no_grad():
             transformers_outputs = transformers_model(pixel_values=pixel_values, pixel_mask=pixel_mask)
         ov_outputs = ov_model(pixel_values=pixel_values, pixel_mask=pixel_mask)
-
         self.assertIn("logits", ov_outputs)
         self.assertIn("pred_boxes", ov_outputs)
         self.assertIsInstance(ov_outputs.logits, torch.Tensor)
@@ -1343,7 +1338,9 @@ class OVModelForObjectDetectionIntegrationTest(unittest.TestCase):
         # numpy inputs should also work and return numpy outputs
         np_outputs = ov_model(pixel_values=pixel_values.numpy(), pixel_mask=pixel_mask.numpy())
         self.assertIsInstance(np_outputs.logits, np.ndarray)
+        self.assertIsInstance(np_outputs.pred_boxes, np.ndarray)
         self.assertTrue(np.allclose(np_outputs.logits, transformers_outputs.logits.numpy(), atol=1e-4))
+        self.assertTrue(np.allclose(np_outputs.pred_boxes, transformers_outputs.pred_boxes.numpy(), atol=1e-4))
 
         del transformers_model
         del ov_model
@@ -1353,11 +1350,24 @@ class OVModelForObjectDetectionIntegrationTest(unittest.TestCase):
     def test_pipeline(self, model_arch):
         set_seed(SEED)
         model_id = MODEL_NAMES[model_arch]
-        model = OVModelForObjectDetection.from_pretrained(model_id, device=OPENVINO_DEVICE)
+        model = OVModelForObjectDetection.from_pretrained(
+            model_id,
+            export=True,
+            ov_config=F32_CONFIG,
+            device=OPENVINO_DEVICE,
+        )
         model.eval()
-        preprocessor = AutoImageProcessor.from_pretrained(model_id, size={"height": self.IMAGE_SIZE, "width": self.IMAGE_SIZE})
-        pipe = pipeline("object-detection", model=model, feature_extractor=preprocessor, threshold=0.0)
-        outputs = pipe(TEST_IMAGE_URL)
+        image_size = model.config.backbone_config.image_size
+        preprocessor = AutoImageProcessor.from_pretrained(
+            model_id, size={"height": image_size, "width": image_size}
+        )
+        pipe = pipeline(
+            "object-detection",
+            model=model,
+            image_processor=preprocessor,
+            threshold=0.0,
+        )
+        outputs = pipe(Image.new("RGB", (image_size, image_size)))
         self.assertEqual(pipe.device, model.device)
         self.assertGreater(len(outputs), 0)
         self.assertTrue(isinstance(outputs[0]["label"], str))

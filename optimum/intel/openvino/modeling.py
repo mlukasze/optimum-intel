@@ -1052,7 +1052,7 @@ OBJECT_DETECTION_EXAMPLE = r"""
 
     >>> processor = {processor_class}.from_pretrained("{checkpoint}")
     >>> model = {model_class}.from_pretrained("{checkpoint}", export=True)
-    >>> pipe = pipeline("object-detection", model=model, feature_extractor=processor)
+    >>> pipe = pipeline("object-detection", model=model, image_processor=processor)
     >>> outputs = pipe("http://images.cocodataset.org/val2017/000000039769.jpg")
     ```
 """
@@ -1060,31 +1060,26 @@ OBJECT_DETECTION_EXAMPLE = r"""
 
 @add_start_docstrings(
     """
-    OpenVINO Model with object detection outputs (logits and pred_boxes) for object detection tasks.
-    Supports DETR-family models including RF-DETR, RT-DETR, and DeformableDETR.
+    OpenVINO model for object detection tasks with classification logits and normalized bounding boxes.
     """,
     MODEL_START_DOCSTRING,
 )
 class OVModelForObjectDetection(OVModel):
-    """
-    OpenVINO model for object detection tasks (DETR-family: RF-DETR, RT-DETR, DETR, etc.).
+    """Run object detection from image tensors and optional pixel masks.
 
-    Inputs: ``pixel_values`` (B, C, H, W) and optional ``pixel_mask`` (B, H, W).
-    Outputs: logits (B, num_queries, num_classes+1) and pred_boxes (B, num_queries, 4).
+    An all-ones ``pixel_mask`` is generated when the exported graph expects the input and no mask is provided.
+    The returned [`~transformers.utils.ModelOutput`] contains ``logits`` and normalized ``pred_boxes``.
     """
 
     export_feature = "object-detection"
     auto_model_class = AutoModelForObjectDetection
-
-    def __init__(self, model=None, config=None, **kwargs):
-        super().__init__(model, config, **kwargs)
 
     @add_start_docstrings_to_model_forward(
         IMAGE_INPUTS_DOCSTRING.format("batch_size, num_channels, height, width")
         + OBJECT_DETECTION_EXAMPLE.format(
             processor_class=_FEATURE_EXTRACTOR_FOR_DOC,
             model_class="OVModelForObjectDetection",
-            checkpoint="Roboflow/rf-detr-base",
+            checkpoint="Roboflow/rf-detr-nano",
         )
     )
     def forward(
@@ -1096,22 +1091,21 @@ class OVModelForObjectDetection(OVModel):
         self.compile()
 
         np_inputs = isinstance(pixel_values, np.ndarray)
-
-        inputs = {"pixel_values": ensure_numpy(pixel_values)}
-        if pixel_mask is not None and "pixel_mask" in self.input_names:
-            inputs["pixel_mask"] = ensure_numpy(pixel_mask)
+        pixel_values = ensure_numpy(pixel_values)
+        inputs = {"pixel_values": pixel_values}
+        if "pixel_mask" in self.input_names:
+            inputs["pixel_mask"] = (
+                ensure_numpy(pixel_mask)
+                if pixel_mask is not None
+                else np.ones((pixel_values.shape[0], pixel_values.shape[2], pixel_values.shape[3]), dtype=np.int64)
+            )
 
         outputs = self._inference(inputs)
-
-        logits = outputs.get("logits")
-        pred_boxes = outputs.get("pred_boxes")
+        logits = outputs["logits"]
+        pred_boxes = outputs["pred_boxes"]
 
         if not np_inputs:
-            logits = torch.from_numpy(logits).to(self.device) if logits is not None else None
-            pred_boxes = torch.from_numpy(pred_boxes).to(self.device) if pred_boxes is not None else None
-
-        # Return a simple namespace-like object with logits and pred_boxes attributes
-        # compatible with transformers post-processing pipelines
-        from transformers.utils.generic import ModelOutput
+            logits = torch.from_numpy(logits).to(self.device)
+            pred_boxes = torch.from_numpy(pred_boxes).to(self.device)
 
         return ModelOutput(logits=logits, pred_boxes=pred_boxes)

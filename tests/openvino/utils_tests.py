@@ -307,7 +307,7 @@ HUB_MODEL_NAMES = {
     "qwen3_asr": "optimum-intel-internal-testing/tiny-random-qwen3-asr",
     "rembert": "optimum-intel-internal-testing/tiny-random-rembert",
     "resnet": "optimum-intel-internal-testing/tiny-random-resnet",
-    "rf_detr": "optimum-intel-internal-testing/tiny-random-rf_detr",
+    "rf_detr": "hf-tiny-v2/tiny-random-RfDetrForObjectDetection",
     "roberta": "optimum-intel-internal-testing/tiny-random-roberta",
     "roformer": "optimum-intel-internal-testing/tiny-random-roformer",
     "segformer": "optimum-intel-internal-testing/tiny-random-SegformerModel",
@@ -403,7 +403,7 @@ _ARCHITECTURES_TO_EXPECTED_INT8 = {
     "roberta": {"model": 68},
     "albert": {"model": 84},
     "vit": {"model": 64},
-    "rf_detr": {"model": 76},
+    "rf_detr": {"model": 116},
     "blenderbot": {"model": 70 if is_transformers_version("<", "5") or is_transformers_version(">=", "5.5") else 72},
     "cohere2": {"model": 30},
     "gpt2": {"model": 44},
@@ -678,6 +678,7 @@ ARCH_TO_MODEL_CLASS = {
 SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED = [
     "bart",
     "musicgen",
+    "rf_detr",
     "whisper",
 ]
 

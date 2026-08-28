@@ -135,6 +135,7 @@ class OVCLIExportTestCase(unittest.TestCase):
         ("text-generation-with-past", "mamba"),
         ("text-generation-with-past", "falcon_mamba"),
         ("text-to-image", "flux.2-klein"),
+        ("object-detection", "rf_detr"),
     ]
     # filter architectures depending on min/max transformers supported versions
     SUPPORTED_ARCHITECTURES = [
@@ -143,13 +144,6 @@ class OVCLIExportTestCase(unittest.TestCase):
         if TEST_NAME_TO_MODEL_TYPE.get(model_type, model_type)
         in get_supported_model_for_library("transformers") | get_supported_model_for_library("diffusers")
     ]
-
-    if is_transformers_version(">=", "5.8.0"):
-        SUPPORTED_ARCHITECTURES.extend(
-            [
-                ("object-detection", "rf_detr"),
-            ]
-        )
 
     EXPECTED_NUMBER_OF_TOKENIZER_MODELS = {
         "gpt2": 2,

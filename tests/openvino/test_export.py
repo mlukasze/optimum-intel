@@ -30,7 +30,11 @@ from utils_tests import (
 )
 
 from optimum.exporters.openvino import export_from_model, main_export
-from optimum.exporters.openvino.model_configs import BertOpenVINOConfig, Qwen3OmniMoeConfigBehavior
+from optimum.exporters.openvino.model_configs import (
+    BertOpenVINOConfig,
+    Qwen3OmniMoeConfigBehavior,
+    RfDetrOpenVINOConfig,
+)
 from optimum.exporters.tasks import TasksManager
 from optimum.intel import (
     OVFlux2KleinPipeline,
@@ -69,6 +73,22 @@ from optimum.utils.save_utils import maybe_load_preprocessors
 
 
 logger = logging.get_logger()
+
+
+class RfDetrOpenVINOConfigTest(unittest.TestCase):
+    @unittest.skipUnless(is_transformers_version(">=", "5.10.0"), "RF-DETR requires Transformers 5.10 or newer")
+    def test_rectangular_dummy_input_shape(self):
+        from transformers import RfDetrConfig, RfDetrDinov2Config
+
+        config = RfDetrConfig(
+            backbone_config=RfDetrDinov2Config(image_size=(513, 601), patch_size=(14, 16), num_windows=4)
+        )
+        export_config = RfDetrOpenVINOConfig(config, task="object-detection")
+
+        dummy_inputs = export_config.generate_dummy_inputs(framework="pt")
+
+        self.assertEqual(dummy_inputs["pixel_values"].shape[-2:], (560, 640))
+        self.assertEqual(dummy_inputs["pixel_mask"].shape[-2:], (560, 640))
 
 
 class ExportModelTest(unittest.TestCase):
@@ -120,6 +140,7 @@ class ExportModelTest(unittest.TestCase):
         "gemma3n": OVModelForVisualCausalLM,
         "flux.2-klein": OVFlux2KleinPipeline,
         "qwen3_omni_moe": OVModelForMultimodalLM,
+        "rf_detr": OVModelForObjectDetection,
     }
     # filter architectures depending on min/max transformers supported versions
     SUPPORTED_ARCHITECTURES = {
@@ -128,9 +149,6 @@ class ExportModelTest(unittest.TestCase):
         if TEST_NAME_TO_MODEL_TYPE.get(model_type, model_type)
         in get_supported_model_for_library("transformers") | get_supported_model_for_library("diffusers")
     }
-
-    if is_transformers_version(">=", "5.8.0"):
-        SUPPORTED_ARCHITECTURES.update({"rf_detr": OVModelForObjectDetection})
 
     EXPECTED_DIFFUSERS_SCALE_FACTORS = {
         "stable-diffusion-xl": {"vae_encoder": "128.0", "vae_decoder": "128.0"},
