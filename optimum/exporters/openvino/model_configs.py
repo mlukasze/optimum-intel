@@ -6610,34 +6610,36 @@ class TrOCROpenVINOConfig(TextSeq2SeqOpenVINOConfig):
 
 
 class RfDetrDummyVisionInputGenerator(DummyVisionInputGenerator):
-    """Dummy vision input generator for RF-DETR.
+    """Generate model-specific inputs compatible with RF-DETR windowed attention.
 
-    RF-DETR's deformable-attention decoder selects the top-``num_queries`` (default 300)
-    proposals out of the flattened multi-scale feature map produced by the DINOv2 backbone.
-    The generic default dummy image size (64x64) yields too few spatial positions, which makes
-    tracing fail with ``selected index k out of range``. It is also not necessarily a multiple
-    of ``patch_size * num_windows`` (commonly 14 * 4 = 56), a hard requirement of the windowed
-    backbone attention. 560x560 matches the resolution the reference checkpoints are trained
-    and evaluated at and is a safe default across all RF-DETR configurations (divisible by any
-    ``patch_size * num_windows`` combination used in practice).
+    Generic 64x64 dummy inputs may provide too few spatial positions and may not be divisible by
+    ``patch_size * num_windows``. Each configured image dimension is rounded up to the nearest compatible size.
     """
 
     def __init__(self, task: str, normalized_config: NormalizedVisionConfig, **kwargs):
-        kwargs.setdefault("width", 560)
-        kwargs.setdefault("height", 560)
+        backbone_config = normalized_config.config.backbone_config
+        image_size = backbone_config.image_size
+        image_height, image_width = image_size if isinstance(image_size, (list, tuple)) else (image_size, image_size)
+        patch_size = backbone_config.patch_size
+        patch_height, patch_width = patch_size if isinstance(patch_size, (list, tuple)) else (patch_size, patch_size)
+        block_height = patch_height * backbone_config.num_windows
+        block_width = patch_width * backbone_config.num_windows
+        export_height = ((image_height + block_height - 1) // block_height) * block_height
+        export_width = ((image_width + block_width - 1) // block_width) * block_width
+        kwargs.setdefault("height", export_height)
+        kwargs.setdefault("width", export_width)
         super().__init__(task, normalized_config, **kwargs)
 
 
 @register_in_tasks_manager("rf_detr", *["object-detection"], library_name="transformers")
 class RfDetrOpenVINOConfig(VisionOpenVINOConfig):
-    """OpenVINO export configuration for RF-DETR (Roboflow Real-time Detection Transformer).
+    """OpenVINO export configuration for RF-DETR object detection models.
 
-    RF-DETR uses a DINOv2 backbone + deformable DETR decoder.
-    Inputs: pixel_values (B, C, H, W), pixel_mask (B, H, W).
-    Outputs: logits (B, num_queries, num_classes+1), pred_boxes (B, num_queries, 4).
+    RF-DETR combines a DINOv2 backbone with a deformable DETR decoder. The exported model consumes
+    ``pixel_values`` and ``pixel_mask`` and returns class ``logits`` and normalized ``pred_boxes``.
     """
 
-    MIN_TRANSFORMERS_VERSION = "5.8.0"
+    MIN_TRANSFORMERS_VERSION = "5.10.0"
     NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
     DUMMY_INPUT_GENERATOR_CLASSES = (RfDetrDummyVisionInputGenerator,)
 

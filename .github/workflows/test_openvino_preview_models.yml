@@ -60,7 +60,11 @@ jobs:
         run: |
           uv pip install --pre -U openvino openvino-tokenizers openvino-genai --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
 
-      - name: Gemma 4 Unified Validation
+      - name: Gemma 4 Unified and RF-DETR Validation
         run: |
           uv pip install "transformers>=5.10,<5.11"
-          pytest tests/openvino/${{ matrix.test-pattern }} -k gemma4_unified --durations=0
+          pytest tests/openvino/${{ matrix.test-pattern }} -k "gemma4_unified or rf_detr or object_detection" --durations=0
+
+      - name: RF-DETR Runtime Validation
+        if: ${{ matrix.test-pattern == '*export*' }}
+        run: pytest tests/openvino/test_modeling.py -k OVModelForObjectDetectionIntegrationTest --durations=0
