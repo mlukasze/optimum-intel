@@ -53,7 +53,12 @@ from transformers.models.speecht5.modeling_speecht5 import SpeechT5EncoderWithSp
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput
 
-from optimum.exporters.openvino._ov_ops import convert_recurrent_attention_cell, convert_recurrent_selective_ssm_cell
+from optimum.exporters.openvino._ov_ops import (
+    convert_lfm2_vl_spatial_reshape,
+    convert_recurrent_attention_cell,
+    convert_recurrent_selective_ssm_cell,
+    convert_siglip2_resize_positional_embeddings,
+)
 from optimum.exporters.openvino.base import OpenVINOConfig
 from optimum.exporters.openvino.patching_utils import (
     ModelPatcher,
@@ -8046,47 +8051,114 @@ class Lfm2VlLanguageModelPatcher(Lfm2ModelPatcher):
             conv_layer.slow_forward = conv_layer._orig_forward
 
 
+class Siglip2ResizePositionalEmbeddingsCell(torch.nn.Module):
+    """
+    Vectorized replacement for Siglip2VisionEmbeddings.resize_positional_embeddings, wrapped as a
+    `torch.nn.Module` so it can be intercepted by an OpenVINO `ModuleExtension` (see
+    `Lfm2VlImageEmbeddingModelPatcher`, which attaches an instance of this class to every
+    `Siglip2VisionEmbeddings` submodule before tracing).
+
+    `forward` below is the eager/PyTorch reference implementation: it assumes all tiles in the
+    batch share the same spatial shape (`spatial_shapes[0]`), which avoids the data-dependent
+    per-tile for-loop that breaks `torch.jit.trace`, and is used for shape/dtype inference during
+    tracing and for any non-OpenVINO PyTorch path (e.g. quantization calibration).
+
+    For the actual exported IR, `convert_siglip2_resize_positional_embeddings` in
+    `optimum/exporters/openvino/_ov_ops.py` is used instead (registered as a `ConversionExtension`
+    on the `Siglip2ResizePositionalEmbeddingsOp` this module gets replaced with) -- it reimplements
+    the same computation using OpenVINO ops driven by the runtime `spatial_shapes` values, so the
+    resulting graph is genuinely dynamic-shape-safe (works for any valid `spatial_shapes` at
+    inference, not just the one used during export -- see that function's docstring for the full
+    reasoning and the tested numerical trade-offs of the fix).
+    """
+
+    def forward(self, positional_embeddings: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        embed_dim = positional_embeddings.shape[-1]
+        source_dtype = positional_embeddings.dtype
+        batch_size = spatial_shapes.shape[0]
+
+        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
+        pe = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
+
+        # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
+        if pe.device.type == "cpu":
+            pe = pe.to(torch.float32)
+
+        # All tiles have the same spatial shape -- bake in at trace time (only affects this eager
+        # reference path; the actual exported graph uses the OpenVINO conversion rule instead, see
+        # class docstring above).
+        height = int(spatial_shapes[0, 0])
+        width = int(spatial_shapes[0, 1])
+
+        resized = F.interpolate(pe, size=(height, width), mode="bilinear", align_corners=False, antialias=True)
+        # (1, embed_dim, h, w) -> (h*w, embed_dim)
+        resized = resized.reshape(embed_dim, height * width).transpose(0, 1).to(source_dtype)
+
+        # All tiles are identical, use expand to avoid memory duplication
+        result = resized.unsqueeze(0).expand(batch_size, height * width, embed_dim)
+        return result.contiguous()
+
+
 def siglip2_resize_positional_embeddings_patched(
+    self,
     positional_embeddings: torch.Tensor,
     spatial_shapes: torch.Tensor,
     max_length: int,
 ) -> torch.Tensor:
     """
-    Vectorized replacement for Siglip2VisionEmbeddings.resize_positional_embeddings.
-    Assumes all tiles in the batch share the same spatial shape (spatial_shapes[0]).
-    This avoids a data-dependent for-loop that breaks torch.jit.trace.
+    Replacement for Siglip2VisionEmbeddings.resize_positional_embeddings that delegates the actual
+    resize to `self._resize_positional_embeddings_cell`, a `Siglip2ResizePositionalEmbeddingsCell`
+    instance attached to every `Siglip2VisionEmbeddings` submodule by
+    `Lfm2VlImageEmbeddingModelPatcher.__enter__`. Assigning a plain function (not `staticmethod`)
+    here means Python's normal descriptor protocol binds `self` automatically when it is invoked
+    as `self.resize_positional_embeddings(...)` from (unpatched) `Siglip2VisionEmbeddings.forward`.
+
+    `max_length` is intentionally unused for the resize itself: `Lfm2VlImageEmbeddingModelPatcher`'s
+    vectorized `get_image_features` replacement (`lfm2_vl_get_image_features_patched`) assumes
+    every tile shares the same `spatial_shapes` row, which makes `max_length`
+    (== `pixel_values.shape[1]`, passed in by `Siglip2VisionEmbeddings.forward`) always equal
+    `height * width` for that shared shape -- i.e. no padding is ever actually needed in this
+    simplified/vectorized flow (see `_ov_ops.py::convert_siglip2_resize_positional_embeddings` for
+    the full reasoning). The assertion below turns any violation of that invariant into an
+    immediate, clearly-diagnosed failure instead of a silent shape mismatch.
     """
-    import torch.nn.functional as F
-
-    embed_dim = positional_embeddings.shape[-1]
-    source_dtype = positional_embeddings.dtype
-    batch_size = spatial_shapes.shape[0]
-
-    # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
-    pe = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
-
-    # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
-    if pe.device.type == "cpu":
-        pe = pe.to(torch.float32)
-
-    # All tiles have the same spatial shape -- bake in at trace time
     height = int(spatial_shapes[0, 0])
     width = int(spatial_shapes[0, 1])
+    assert max_length == height * width, (
+        "Lfm2VlImageEmbeddingModelPatcher assumes every tile shares spatial_shapes[0] (no "
+        f"cross-tile padding); got max_length={max_length} but height*width={height * width}."
+    )
+    return self._resize_positional_embeddings_cell(positional_embeddings, spatial_shapes)
 
-    resized = F.interpolate(pe, size=(height, width), mode="bilinear", align_corners=False, antialias=True)
-    # (1, embed_dim, h, w) -> (h*w, embed_dim)
-    resized = resized.reshape(embed_dim, height * width).transpose(0, 1).to(source_dtype)
 
-    # Build result: [batch_size, max_length, embed_dim]
-    # All tiles are identical, use expand to avoid memory duplication
-    result = resized.unsqueeze(0).expand(batch_size, height * width, embed_dim)
+class Lfm2VlSpatialReshapeCell(torch.nn.Module):
+    """
+    Wraps the "reshape SigLIP2 vision tower output into a spatial grid" step of
+    `lfm2_vl_get_image_features_patched` as a `torch.nn.Module` so it can be intercepted by an
+    OpenVINO `ModuleExtension` (see `Lfm2VlImageEmbeddingModelPatcher`, which attaches an instance
+    of this class to the `Lfm2VlModel` before tracing).
 
-    if max_length > height * width:
-        # Pad the remaining positions with the first embedding value
-        pad = resized[0:1].unsqueeze(0).expand(batch_size, max_length - height * width, embed_dim)
-        result = torch.cat([result, pad], dim=1)
+    `forward` below is the eager/PyTorch reference implementation (assumes all tiles share the
+    same spatial shape, same as `Siglip2ResizePositionalEmbeddingsCell`); the actual exported IR
+    uses `convert_lfm2_vl_spatial_reshape` in `optimum/exporters/openvino/_ov_ops.py` instead, so
+    the reshape (and everything chained off its output, in particular
+    `Lfm2VlMultiModalProjector.pixel_unshuffle`) is genuinely dynamic-shape-safe -- see that
+    function's docstring for the full reasoning.
+    """
 
-    return result.contiguous()
+    def forward(self, last_hidden_state: torch.Tensor, spatial_shapes: torch.Tensor) -> torch.Tensor:
+        num_tiles = last_hidden_state.size(0)
+        vision_hidden_size = last_hidden_state.size(2)
+
+        # All tiles have the same spatial shape -- bake in at trace time (only affects this eager
+        # reference path; the actual exported graph uses the OpenVINO conversion rule instead, see
+        # class docstring above).
+        height = int(spatial_shapes[0, 0])
+        width = int(spatial_shapes[0, 1])
+
+        return last_hidden_state[:, : height * width, :].reshape(num_tiles, height, width, vision_hidden_size)
 
 
 def lfm2_vl_get_image_features_patched(
@@ -8120,15 +8192,10 @@ def lfm2_vl_get_image_features_patched(
     last_hidden_state = image_outputs.last_hidden_state
     # shape: [num_tiles, max_patches, vision_hidden_size]
 
-    num_tiles = last_hidden_state.size(0)
-    vision_hidden_size = last_hidden_state.size(2)
-
-    # All tiles share the same spatial shape -- bake in at trace time
-    height = int(spatial_shapes[0, 0])
-    width = int(spatial_shapes[0, 1])
-
-    # Slice valid patches and reshape to spatial grid: [num_tiles, h, w, vision_hidden_size]
-    feature = last_hidden_state[:, : height * width, :].reshape(num_tiles, height, width, vision_hidden_size)
+    # Reshape to spatial grid: [num_tiles, h, w, vision_hidden_size]. See
+    # Lfm2VlSpatialReshapeCell / convert_lfm2_vl_spatial_reshape docstrings for why this is
+    # routed through a ModuleExtension instead of a plain `.reshape(...)` call.
+    feature = self._spatial_reshape_cell(last_hidden_state, spatial_shapes)
 
     # Apply multi-modal projector (pixel_unshuffle + norm + linear)
     # Works naturally over the batch dimension
@@ -8157,6 +8224,8 @@ class Lfm2VlImageEmbeddingModelPatcher(ModelPatcher):
         model: "PreTrainedModel",
         model_kwargs: Optional[Dict[str, Any]] = None,
     ):
+        from openvino.frontend.pytorch import ConversionExtension, ModuleExtension
+
         def lfm2_vl_forward(self_model, pixel_values, spatial_shapes, pixel_attention_mask):
             return lfm2_vl_get_image_features_patched(
                 self_model.model,
@@ -8168,6 +8237,23 @@ class Lfm2VlImageEmbeddingModelPatcher(ModelPatcher):
         model.__orig_forward = model.forward
         model.forward = types.MethodType(lfm2_vl_forward, model)
         super().__init__(config, model, model_kwargs)
+
+        # See Siglip2ResizePositionalEmbeddingsCell / convert_siglip2_resize_positional_embeddings
+        # and Lfm2VlSpatialReshapeCell / convert_lfm2_vl_spatial_reshape docstrings for why these
+        # ModuleExtension + ConversionExtension pairs are needed (in short: plain torch.jit.trace
+        # of ops whose size/shape argument is derived from the spatial_shapes runtime input bakes
+        # that value in as a constant, so it doesn't generalize to other spatial_shapes at
+        # inference).
+        self.module_extensions = {
+            Siglip2ResizePositionalEmbeddingsCell: ModuleExtension(
+                Siglip2ResizePositionalEmbeddingsCell, "Siglip2ResizePositionalEmbeddingsOp"
+            ),
+            Lfm2VlSpatialReshapeCell: ModuleExtension(Lfm2VlSpatialReshapeCell, "Lfm2VlSpatialReshapeOp"),
+        }
+        self.conversion_extensions = [
+            ConversionExtension("Siglip2ResizePositionalEmbeddingsOp", convert_siglip2_resize_positional_embeddings),
+            ConversionExtension("Lfm2VlSpatialReshapeOp", convert_lfm2_vl_spatial_reshape),
+        ]
 
     def __enter__(self):
         from transformers.models.siglip2.modeling_siglip2 import Siglip2VisionEmbeddings
@@ -8183,9 +8269,24 @@ class Lfm2VlImageEmbeddingModelPatcher(ModelPatcher):
         Siglip2VisionEmbeddings._orig_resize_positional_embeddings = (
             Siglip2VisionEmbeddings.resize_positional_embeddings
         )
-        Siglip2VisionEmbeddings.resize_positional_embeddings = staticmethod(
-            siglip2_resize_positional_embeddings_patched
-        )
+        Siglip2VisionEmbeddings.resize_positional_embeddings = siglip2_resize_positional_embeddings_patched
+
+        # Attach a Siglip2ResizePositionalEmbeddingsCell instance to every Siglip2VisionEmbeddings
+        # submodule so the ModuleExtension registered in __init__ can find and replace it. Kept as
+        # real submodules (not created ad hoc inside the patched staticmethod) so the OpenVINO
+        # PyTorch frontend's module-based matching can discover the call during tracing.
+        self._patched_embeddings_modules = [
+            module for module in self._model.modules() if isinstance(module, Siglip2VisionEmbeddings)
+        ]
+        for module in self._patched_embeddings_modules:
+            module._resize_positional_embeddings_cell = Siglip2ResizePositionalEmbeddingsCell()
+
+        # Same reasoning, for the vision-tower-output -> spatial-grid reshape used by
+        # lfm2_vl_get_image_features_patched. `self._model.model` is the Lfm2VlModel instance
+        # (`self._model` is the wrapping *ForConditionalGeneration model; `lfm2_vl_forward` calls
+        # `lfm2_vl_get_image_features_patched(self_model.model, ...)`, so `self._spatial_reshape_cell`
+        # must live on that same `.model` object).
+        self._model.model._spatial_reshape_cell = Lfm2VlSpatialReshapeCell()
 
     def __exit__(self, exc_type, exc_value, traceback):
         from transformers.models.siglip2.modeling_siglip2 import Siglip2VisionEmbeddings
@@ -8199,6 +8300,11 @@ class Lfm2VlImageEmbeddingModelPatcher(ModelPatcher):
         Siglip2VisionEmbeddings.resize_positional_embeddings = (
             Siglip2VisionEmbeddings._orig_resize_positional_embeddings
         )
+        for module in getattr(self, "_patched_embeddings_modules", []):
+            if hasattr(module, "_resize_positional_embeddings_cell"):
+                del module._resize_positional_embeddings_cell
+        if hasattr(self._model.model, "_spatial_reshape_cell"):
+            del self._model.model._spatial_reshape_cell
 
 
 # Copied from https://github.com/huggingface/transformers/blob/v4.56.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L81
