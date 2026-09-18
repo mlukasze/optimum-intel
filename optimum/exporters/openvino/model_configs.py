@@ -104,6 +104,8 @@ from optimum.exporters.openvino.input_generators import (
     OVMiniCPM3DummyPastKeyValuesGenerator,
     PooledProjectionsDummyInputGenerator,
     Qwen3_5DummyPastKeyValuesGenerator,
+    Qwen4ExpQSAMaskInputGenerator,
+    Qwen4ExpDummyPastKeyValuesGenerator,
     Qwen3_5MTPDummyInputGenerator,
     Qwen3ASRDummySeq2SeqPastKeyValuesGenerator,
     Qwen3NextDummyPastKeyValuesGenerator,
@@ -198,6 +200,7 @@ from optimum.exporters.openvino.model_patcher import (
     Qwen3ASRModelPatcher,
     Qwen3MoeModelPatcher,
     Qwen3NextModelPatcher,
+    Qwen4ExpModelPatcher,
     Qwen3OmniMoeAudioEncoderPatcher,
     Qwen3OmniMoeCode2WavPatcher,
     Qwen3OmniMoeCodePredictorPatcher,
@@ -1826,6 +1829,8 @@ class LMInputEmbedsConfigHelper(TextDecoderWithPositionIdsOpenVINOConfig):
             inputs_embed_shape
         )
         dummy_inputs["inputs_embeds"] = inputs_embeds
+        if "ple_input_ids" in self.inputs:
+            dummy_inputs["ple_input_ids"] = input_ids
         if "token_type_ids" in self.inputs:
             token_type_ids_shape = (input_ids.shape[0], input_ids.shape[1] + pask_key_values[0][0].shape[-2])
             dummy_inputs["token_type_ids"] = self.orig_export_config.DUMMY_INPUT_GENERATOR_CLASSES[
@@ -3921,7 +3926,9 @@ class Qwen2VLOpenVINOConfig(BaseVLMOpenVINOConfig):
                 self.float_dtype,
                 model_patcher=Qwen2VLLanguageModelPatcher,
                 dummy_input_generator=DummyQwen2VLLMInputGenerator,
-                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+                inputs_update={
+                    "position_ids": {1: "batch_size", 2: "sequence_length"},
+                },
             )
 
         if behavior == QwenVLConfigBehavior.VISION_EMBEDDINGS:
@@ -4380,7 +4387,9 @@ class Qwen3OmniMoeOpenVINOConfig(BaseVLMOpenVINOConfig):
                 internal_config,
                 patcher_cls=Qwen3OmniMoeLanguageModelPatcher,
                 dummy_input_generator=DummyQwen3OmniMoeLMInputGenerator,
-                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+                inputs_update={
+                    "position_ids": {1: "batch_size", 2: "sequence_length"},
+                },
             )
             config._normalized_config = internal_config._normalized_config
             vision_config = getattr(thinker_config, "vision_config", None)
@@ -7378,6 +7387,132 @@ class Qwen3_5OpenVINOConfig(Qwen3VLOpenVINOConfig):
                 "qwen3_5_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
             ).outputs
         raise Exception("Unknown Qwen3.5 behavior type.")
+
+
+@register_in_tasks_manager(
+    "qwen4_exp_text",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+@register_in_tasks_manager(
+    "qwen4_exp",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class Qwen4ExpTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
+    MIN_TRANSFORMERS_VERSION = "5.16.0"
+    MAX_TRANSFORMERS_VERSION = "5.99.99"
+    include_qsa_masks = True
+    DUMMY_INPUT_GENERATOR_CLASSES = (
+        DummyTextInputGenerator,
+        Qwen4ExpDummyPastKeyValuesGenerator,
+        Qwen4ExpQSAMaskInputGenerator,
+    )
+    DUMMY_PKV_GENERATOR_CLASS = Qwen4ExpDummyPastKeyValuesGenerator
+    _MODEL_PATCHER = Qwen4ExpModelPatcher
+
+    def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+        decoder_sequence_name = (
+            "past_sequence_length" if direction == "inputs" else "past_sequence_length + sequence_length"
+        )
+        cache_name_prefix = "cache_params.past" if direction == "inputs" else "cache_params.present"
+        num_full_attn_layers = sum(
+            layer_type in {"full_attention", "qwen_sparse_attention"}
+            for layer_type in self._normalized_config.layer_types
+        )
+        num_linear_attn_layers = self._normalized_config.layer_types.count("linear_attention")
+        for index in range(num_linear_attn_layers):
+            inputs_or_outputs[f"{cache_name_prefix}.conv.{index}"] = {0: "batch_size"}
+            inputs_or_outputs[f"{cache_name_prefix}.ssm.{index}"] = {0: "batch_size"}
+        for index in range(num_full_attn_layers):
+            inputs_or_outputs[f"{cache_name_prefix}.key.{index}"] = {
+                0: "batch_size",
+                2: decoder_sequence_name,
+            }
+            inputs_or_outputs[f"{cache_name_prefix}.value.{index}"] = {
+                0: "batch_size",
+                2: decoder_sequence_name,
+            }
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        inputs = super().inputs
+        if self.include_qsa_masks:
+            inputs["qsa_masks"] = {
+                0: "num_sparse_layers",
+                1: "batch_size",
+                3: "sequence_length",
+                4: "past_sequence_length + sequence_length",
+            }
+        return inputs
+
+
+@register_in_tasks_manager(
+    "qwen4_exp",
+    *["image-text-to-text"],
+    library_name="transformers",
+)
+class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
+    MIN_TRANSFORMERS_VERSION = "5.16.0"
+    MAX_TRANSFORMERS_VERSION = "5.99.99"
+    SUPPORTED_BEHAVIORS = [behavior.value for behavior in QwenVLConfigBehavior if behavior.value != "mtp"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.SUPPORTED_BEHAVIORS = [behavior for behavior in self.SUPPORTED_BEHAVIORS if behavior != "mtp"]
+
+    def with_behavior(self, behavior: Union[str, QwenVLConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
+            behavior = QwenVLConfigBehavior(behavior)
+        if behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "qwen4_exp_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            )
+        if behavior == QwenVLConfigBehavior.LANGUAGE:
+            language_config = get_vlm_text_generation_config(
+                "qwen4_exp_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=Qwen4ExpModelPatcher,
+                dummy_input_generator=DummyQwen3_5LMInputGenerator,
+                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+            )
+            language_config.orig_export_config.include_qsa_masks = False
+            return language_config
+        if behavior in (
+            QwenVLConfigBehavior.VISION_EMBEDDINGS,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_POS,
+        ):
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+        raise ValueError(f"Unsupported Qwen4Exp behavior: {behavior}")
+
+    @staticmethod
+    def get_model_for_behavior(model, behavior: Union[str, QwenVLConfigBehavior]):
+        return Qwen3_5OpenVINOConfig.get_model_for_behavior(model, behavior)
+
+    def patch_model_for_export(self, model, model_kwargs=None):
+        if self._behavior == QwenVLConfigBehavior.LANGUAGE:
+            return Qwen4ExpModelPatcher(self, model, model_kwargs or {})
+        return super().patch_model_for_export(model, model_kwargs)
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == QwenVLConfigBehavior.LANGUAGE:
+            return get_vlm_internal_text_generation_config(
+                "qwen4_exp_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            ).outputs
+        return super().outputs
 
 
 class Qwen3_5MTPOpenVINOConfig(OpenVINOConfigWithPast):

@@ -9306,17 +9306,19 @@ class Qwen3NextModelPatcher(OVDecoderModelPatcher):
             def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
                 """Returns the sequence length of the cached states. A layer index can be optionally passed."""
                 # take any layer that contains cache and not empty tensor
-                layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
+                if layer_idx not in self.full_attn_mapping:
+                    layer_idx = next(iter(self.full_attn_mapping))
                 layer_idx = self.full_attn_mapping[layer_idx]
                 if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
                     return 0
                 return self.key_cache[layer_idx].shape[-2]
 
-            @property
-            def has_previous_state(self):
-                """We have a previous state if the last linear (conv) layer was already updated."""
-                layer_idx = self.linear_attn_mapping[self.last_linear_layer]
-                return self.conv_states[layer_idx] is not None
+            def has_previous_state(self, layer_idx: Optional[int] = None, state_idx: Optional[int] = None) -> bool:
+                if state_idx == 2:
+                    return False
+                if layer_idx is None or layer_idx not in self.linear_attn_mapping:
+                    layer_idx = self.last_linear_layer
+                return self.conv_states[self.linear_attn_mapping[layer_idx]] is not None
 
         # the patch is needed to include KV-cache, Conv, and SSM states in the inputs and outputs.
         def patched_forward(
@@ -9964,6 +9966,7 @@ def qwen3_5_gated_delta_net_forward(
     cache_params=None,
     cache_position: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
+    **kwargs,
 ):
     def apply_mask_to_padding_states(hidden_states, attention_mask):
         """
@@ -10059,7 +10062,10 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
         model: "PreTrainedModel",
         model_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        except ImportError:
+            from transformers.cache_utils import DynamicCache as Qwen3_5DynamicCache
 
         from openvino.frontend.pytorch import ConversionExtension, ModuleExtension
 
@@ -10081,16 +10087,22 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 # Call parent constructor with all required arguments
                 super().__init__(config=config)
 
+                self.layer_types = list(config.layer_types)
+                self.transformer_layers = list(range(len(self.layer_types)))
+                self.last_linear_layer = max(
+                    idx for idx, layer_type in enumerate(self.layer_types) if layer_type == "linear_attention"
+                )
                 self.conv_states = conv_states
                 self.recurrent_states = recurrent_states
                 self.key_cache = key_cache
                 self.value_cache = value_cache
+                self.indexer_cache = [None] * len(self.layer_types)
                 self.full_attn_mapping = {}
                 self.linear_attn_mapping = {}
                 full_attn_layer_idx = 0
                 linear_attn_layer_idx = 0
                 for i in range(len(config.layer_types)):
-                    if self.layer_types[i] == "full_attention":
+                    if self.layer_types[i] in {"full_attention", "qwen_sparse_attention"}:
                         self.full_attn_mapping[i] = full_attn_layer_idx
                         full_attn_layer_idx += 1
                     elif self.layer_types[i] == "linear_attention":
@@ -10115,20 +10127,31 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
 
                 return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+            def update_indexer(self, indexer_key_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+                if self.indexer_cache[layer_idx] is None:
+                    self.indexer_cache[layer_idx] = indexer_key_states
+                else:
+                    self.indexer_cache[layer_idx] = torch.cat(
+                        [self.indexer_cache[layer_idx], indexer_key_states], dim=1
+                    )
+                return self.indexer_cache[layer_idx]
+
             def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
                 """Returns the sequence length of the cached states. A layer index can be optionally passed."""
                 # take any layer that contains cache and not empty tensor
-                layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
+                if layer_idx not in self.full_attn_mapping:
+                    layer_idx = next(iter(self.full_attn_mapping))
                 layer_idx = self.full_attn_mapping[layer_idx]
                 if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
                     return 0
                 return self.key_cache[layer_idx].shape[-2]
 
-            @property
-            def has_previous_state(self):
-                """We have a previous state if the last linear (conv) layer was already updated."""
-                layer_idx = self.linear_attn_mapping[self.last_linear_layer]
-                return self.conv_states[layer_idx] is not None
+            def has_previous_state(self, layer_idx: Optional[int] = None, state_idx: Optional[int] = None) -> bool:
+                if state_idx == 2:
+                    return False
+                if layer_idx is None or layer_idx not in self.linear_attn_mapping:
+                    layer_idx = self.last_linear_layer
+                return self.conv_states[self.linear_attn_mapping[layer_idx]] is not None
 
         # the patch is needed to include KV-cache, Conv, and SSM states in the inputs and outputs.
         def patched_forward(
@@ -10137,10 +10160,38 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
             cache_params=None,
             inputs_embeds=None,
             position_ids=None,
+            qsa_masks=None,
+            ple_input_ids=None,
         ):
             text_config = self._text_config
-            num_full_attn_layers = text_config.layer_types.count("full_attention")
+            num_full_attn_layers = sum(
+                layer_type in {"full_attention", "qwen_sparse_attention"} for layer_type in text_config.layer_types
+            )
             num_linear_attn_layers = text_config.layer_types.count("linear_attention")
+
+            if self._is_vlm and qsa_masks is None:
+                sequence_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+                key_length = attention_mask.shape[-1] if attention_mask is not None else sequence_length
+                qsa_masks = torch.zeros(
+                    (
+                        text_config.layer_types.count("qwen_sparse_attention"),
+                        inputs_embeds.shape[0] if inputs_embeds is not None else input_ids.shape[0],
+                        1,
+                        sequence_length,
+                        key_length,
+                    ),
+                    dtype=torch.float32,
+                    device=inputs_embeds.device if inputs_embeds is not None else input_ids.device,
+                )
+
+            if self._is_vlm and ple_input_ids is None and getattr(text_config, "ple_layer_ids", []):
+                batch_size = inputs_embeds.shape[0] if inputs_embeds is not None else input_ids.shape[0]
+                sequence_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+                ple_input_ids = torch.zeros(
+                    (batch_size, sequence_length),
+                    dtype=torch.long,
+                    device=inputs_embeds.device if inputs_embeds is not None else input_ids.device,
+                )
 
             use_cache = False
             wrapped_cache_params = None
@@ -10166,23 +10217,31 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
 
             if self._is_vlm:
                 # VLM case: call language model through the composite model
-                outputs_lm = self._text_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=wrapped_cache_params,
-                    use_cache=use_cache,
-                )
+                lm_kwargs = {
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "past_key_values": wrapped_cache_params,
+                    "use_cache": use_cache,
+                    "ple_input_ids": ple_input_ids,
+                }
+                if qsa_masks is not None:
+                    lm_kwargs["qsa_masks"] = qsa_masks
+                outputs_lm = self._text_model(**lm_kwargs)
                 hidden_states = outputs_lm[0]
                 logits = self._model.lm_head(hidden_states)
                 past_kv = outputs_lm.past_key_values
             else:
-                causal_lm_output = self.model_orig_forward(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=wrapped_cache_params,
-                    use_cache=use_cache,
-                )
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "past_key_values": wrapped_cache_params,
+                    "use_cache": use_cache,
+                    "ple_input_ids": ple_input_ids,
+                }
+                if qsa_masks is not None:
+                    model_kwargs["qsa_masks"] = qsa_masks
+                causal_lm_output = self.model_orig_forward(**model_kwargs)
                 logits = causal_lm_output.logits
                 past_kv = causal_lm_output.past_key_values
             outputs = {
@@ -10631,6 +10690,142 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
             if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
                 sparse_moe_block = decoder_layer.mlp
                 sparse_moe_block.forward = sparse_moe_block._orig_forward
+
+
+def qwen4_exp_external_qsa_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings,
+    attention_mask: torch.Tensor,
+    past_key_values=None,
+    qsa_masks=None,
+    **kwargs,
+):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb, repeat_kv
+
+    if qsa_masks is None:
+        return self._orig_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    selected_token_mask = qsa_masks[self._qsa_mask_index]
+    if attention_mask.is_floating_point():
+        attention_mask = attention_mask + selected_token_mask
+    else:
+        attention_mask = attention_mask & selected_token_mask.bool()
+
+    position_embeddings = tuple(x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+    query_states, gate = torch.chunk(
+        self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+    )
+    gate = gate.reshape(*input_shape, -1)
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    key_length = key_states.shape[-2]
+    if attention_mask.shape[-1] < key_length:
+        attention_mask = F.pad(attention_mask, (key_length - attention_mask.shape[-1], 0), value=0.0)
+    else:
+        attention_mask = attention_mask[..., -key_length:]
+    if selected_token_mask.shape[-1] < key_length:
+        selected_token_mask = F.pad(selected_token_mask, (key_length - selected_token_mask.shape[-1], 0), value=0.0)
+    else:
+        selected_token_mask = selected_token_mask[..., -key_length:]
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    attn_weights = attn_weights + attention_mask
+    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(*input_shape, -1)
+    attn_output = attn_output * torch.sigmoid(gate)
+    return self.o_proj(attn_output), None
+
+
+class _Qwen4ExpIndexerCache:
+    def __init__(self, indexer_keys: torch.Tensor, cache_position: torch.Tensor):
+        self.indexer_keys = indexer_keys
+        self.cache_position = cache_position.reshape(-1).to(device=indexer_keys.device, dtype=torch.long)
+
+    def update_indexer(self, indexer_key_states: torch.Tensor, layer_idx: int):
+        self.indexer_keys = self.indexer_keys.index_copy(1, self.cache_position, indexer_key_states)
+        return self.indexer_keys
+
+
+class Qwen4ExpQSAIndexerModel(nn.Module):
+    """Standalone QSA graph with an explicit fixed-size growing indexer cache."""
+
+    def __init__(self, indexer: nn.Module):
+        super().__init__()
+        self.indexer = indexer
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings_cos: torch.Tensor,
+        position_embeddings_sin: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_indexer_keys: torch.Tensor,
+        cache_position: torch.Tensor,
+    ):
+        cache = _Qwen4ExpIndexerCache(past_indexer_keys, cache_position)
+        selected_mask = self.indexer(
+            hidden_states,
+            (position_embeddings_cos, position_embeddings_sin),
+            attention_mask,
+            cache,
+        )
+        return selected_mask, cache.indexer_keys
+
+
+def make_qwen4_exp_qsa_indexer_model(model: PreTrainedModel, layer_idx: int) -> Qwen4ExpQSAIndexerModel:
+    """Return the standalone exportable QSA graph for one sparse-attention layer."""
+    text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+    return Qwen4ExpQSAIndexerModel(text_model.layers[layer_idx].self_attn.indexer)
+
+
+class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
+    """Initial export boundary for Qwen4Exp-specific cache and QSA handling."""
+
+    def __enter__(self):
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
+
+        super().__enter__()
+        sparse_index = 0
+        for decoder_layer in self._text_model.layers:
+            if isinstance(decoder_layer.mlp, Qwen4ExpTextSparseMoeBlock):
+                decoder_layer.mlp._orig_forward = decoder_layer.mlp.forward
+                decoder_layer.mlp.forward = types.MethodType(
+                    patched_qwen3_5_moe_sparse_moe_block, decoder_layer.mlp
+                )
+            if getattr(decoder_layer, "layer_type", None) == "qwen_sparse_attention":
+                attention = decoder_layer.self_attn
+                attention._orig_forward = attention.forward
+                attention._qsa_mask_index = sparse_index
+                attention.forward = types.MethodType(qwen4_exp_external_qsa_attention_forward, attention)
+                sparse_index += 1
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
+
+        for decoder_layer in self._text_model.layers:
+            if isinstance(decoder_layer.mlp, Qwen4ExpTextSparseMoeBlock):
+                decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
+            if hasattr(decoder_layer, "self_attn") and hasattr(decoder_layer.self_attn, "_orig_forward"):
+                decoder_layer.self_attn.forward = decoder_layer.self_attn._orig_forward
+        super().__exit__(exc_type, exc_value, traceback)
 
 
 class Qwen3_5MoeMTPModule(nn.Module):

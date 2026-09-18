@@ -2048,6 +2048,28 @@ class Qwen3_5DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
         return cache_params
 
 
+class Qwen4ExpDummyPastKeyValuesGenerator(Qwen3_5DummyPastKeyValuesGenerator):
+    def __init__(self, task, normalized_config, **kwargs):
+        super().__init__(task=task, normalized_config=normalized_config, **kwargs)
+        self.num_full_attn_layers = sum(
+            layer_type in {"full_attention", "qwen_sparse_attention"}
+            for layer_type in normalized_config.config.layer_types
+        )
+
+
+class Qwen4ExpQSAMaskInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("qsa_masks",)
+
+    def __init__(self, task, normalized_config, batch_size=DEFAULT_DUMMY_SHAPES["batch_size"], sequence_length=DEFAULT_DUMMY_SHAPES["sequence_length"], **kwargs):
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+        self.num_sparse_layers = normalized_config.config.layer_types.count("qwen_sparse_attention")
+
+    def generate(self, input_name, framework="pt", int_dtype="int64", float_dtype="fp32"):
+        shape = (self.num_sparse_layers, self.batch_size, 1, self.sequence_length, self.sequence_length)
+        return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+
+
 class Qwen3_5MTPDummyInputGenerator(DummyTextInputGenerator):
     """
     Dummy input generator for the Qwen3.5 / Qwen3.5-MoE MTP (Multi-Token Prediction) head.

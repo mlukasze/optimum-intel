@@ -39,7 +39,13 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLModel
-from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel, VisionRotaryEmbedding
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel
+
+try:
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import VisionRotaryEmbedding
+except ImportError:
+    # newer transformers renamed this class; keep compatibility with bleeding-edge installs
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLRotaryEmbedding as VisionRotaryEmbedding
 from transformers.utils import ModelOutput
 
 from optimum.exporters.openvino import main_export
@@ -220,7 +226,7 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if past_len:
                 position_ids = position_ids[..., -inputs_embeds.shape[1] :]
 
-            if self.config.model_type in ["qwen3_5", "qwen3_5_moe"] and position_ids.ndim != 3:
+            if self.config.model_type in ["qwen3_5", "qwen3_5_moe", "qwen4_exp"] and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 4, axis=0)
             elif (self.config.model_type in ["qwen2_vl", "qwen2_5_vl", "qwen3_vl"]) and position_ids.ndim == 2:
                 # Qwen2-VL and Qwen3-VL use 3D mrope (3 spatial dimensions)
@@ -1228,6 +1234,9 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
             and extra_outputs
         ):
             additional_kwargs["per_layer_inputs"] = extra_outputs[0]
+
+        if self.config.model_type == "qwen4_exp" and input_ids is not None:
+            additional_kwargs["ple_input_ids"] = input_ids
 
         return self.language_model.forward(
             input_ids=None,
@@ -3807,9 +3816,9 @@ class _OVQwen2_5_VLForCausalLM(OVModelForVisualCausalLM):
 
 
 if is_transformers_version(">=", "4.57"):
-    _OVQwen2VLForCausalLM.get_rope_index = Qwen2VLModel.get_rope_index
+    _OVQwen2VLForCausalLM.get_rope_index = getattr(Qwen2VLModel, "get_rope_index", None)
     _OVQwen2VLForCausalLM.get_vision_position_ids = getattr(Qwen2VLModel, "get_vision_position_ids", None)
-    _OVQwen2_5_VLForCausalLM.get_rope_index = Qwen2_5_VLModel.get_rope_index
+    _OVQwen2_5_VLForCausalLM.get_rope_index = getattr(Qwen2_5_VLModel, "get_rope_index", None)
     _OVQwen2_5_VLForCausalLM.get_vision_position_ids = getattr(Qwen2_5_VLModel, "get_vision_position_ids", None)
 
 
@@ -4227,10 +4236,11 @@ class _OVQwen3VLForCausalLM(OVModelForVisualCausalLM):
 
 
 if is_transformers_version(">=", "4.57"):
-    _OVQwen3VLForCausalLM.get_placeholder_mask = Qwen3VLModel.get_placeholder_mask
-    _OVQwen3VLForCausalLM.get_rope_index = Qwen3VLModel.get_rope_index
-    _OVQwen3VLForCausalLM.get_video_features = Qwen3VLModel.get_video_features
-    _OVQwen3VLForCausalLM.rot_pos_emb = Qwen3VLVisionModel.rot_pos_emb
+    # getattr(..., None): tolerate upstream renames/removals of these helper methods across transformers versions
+    _OVQwen3VLForCausalLM.get_placeholder_mask = getattr(Qwen3VLModel, "get_placeholder_mask", None)
+    _OVQwen3VLForCausalLM.get_rope_index = getattr(Qwen3VLModel, "get_rope_index", None)
+    _OVQwen3VLForCausalLM.get_video_features = getattr(Qwen3VLModel, "get_video_features", None)
+    _OVQwen3VLForCausalLM.rot_pos_emb = getattr(Qwen3VLVisionModel, "rot_pos_emb", None)
     _OVQwen3VLForCausalLM.get_vision_position_ids = getattr(Qwen3VLModel, "get_vision_position_ids", None)
 
 
@@ -4427,7 +4437,7 @@ class _OVQwen3OmniMoeForCausalLM(OVModelForVisualCausalLM):
             rotary_pos_emb = self.rotary_pos_emb(pos_ids)
         else:
             max_grid_size = grid_thw[:, 1:].max()
-            rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+            rotary_pos_emb_full = self.rotary_pos_emb(torch.arange(max_grid_size, device=grid_thw.device))
             rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
 
         return rotary_pos_emb
@@ -7770,9 +7780,64 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
 
 
 if is_transformers_version(">=", "5.2"):
-    _OVQwen3_5ForCausalLM.get_placeholder_mask = Qwen3_5Model.get_placeholder_mask
-    _OVQwen3_5ForCausalLM.get_rope_index = Qwen3_5Model.get_rope_index
-    _OVQwen3_5ForCausalLM.rot_pos_emb = Qwen3_5VisionModel.rot_pos_emb
+    # getattr(..., None): tolerate upstream renames/removals of these helper methods across transformers versions
+    _OVQwen3_5ForCausalLM.get_placeholder_mask = getattr(Qwen3_5Model, "get_placeholder_mask", None)
+    _OVQwen3_5ForCausalLM.get_rope_index = getattr(Qwen3_5Model, "get_rope_index", None)
+    _OVQwen3_5ForCausalLM.rot_pos_emb = getattr(Qwen3_5VisionModel, "rot_pos_emb", None)
+
+if is_transformers_version(">=", "5.16"):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpModel,
+        Qwen4ExpVisionModel,
+        Qwen4ExpVisionRotaryEmbedding,
+    )
+
+    class _OVQwen4ExpForCausalLM(_OVQwen3_5ForCausalLM):
+        pass
+
+    def _qwen4_exp_rot_pos_emb(self, grid_thw):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h, device=grid_thw.device).unsqueeze(1).expand(-1, w)
+            wpos_ids = torch.arange(w, device=grid_thw.device).unsqueeze(0).expand(h, -1)
+            merge = self.spatial_merge_size
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge).permute(0, 2, 1, 3).flatten()
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge).permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(torch.arange(max_grid_size, device=grid_thw.device))
+        return rotary_pos_emb_full[pos_ids].flatten(1)
+
+    def _qwen4_exp_get_rope_index(
+        self, input_ids, image_grid_thw=None, video_grid_thw=None, attention_mask=None, mm_token_type_ids=None, **kwargs
+    ):
+        if mm_token_type_ids is None:
+            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+            mm_token_type_ids = torch.where(
+                input_ids == self.config.image_token_id,
+                torch.ones_like(mm_token_type_ids),
+                mm_token_type_ids,
+            )
+            mm_token_type_ids = torch.where(
+                input_ids == self.config.video_token_id,
+                torch.full_like(mm_token_type_ids, 2),
+                mm_token_type_ids,
+            )
+        return Qwen4ExpModel.get_rope_index(
+            self,
+            input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+    _OVQwen4ExpForCausalLM.get_placeholder_mask = Qwen4ExpModel.get_placeholder_mask
+    _OVQwen4ExpForCausalLM.get_rope_index = _qwen4_exp_get_rope_index
+    _OVQwen4ExpForCausalLM.get_vision_position_ids = Qwen4ExpModel.get_vision_position_ids
+    _OVQwen4ExpForCausalLM.rot_pos_emb = _qwen4_exp_rot_pos_emb
 
 
 class _OVMuseGlimmerForCausalLM(OVModelForVisualCausalLM):
@@ -7905,6 +7970,8 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "qwen3_5_text": _OVQwen3_5ForCausalLM,
     "qwen3_5_moe": _OVQwen3_5ForCausalLM,
     "qwen3_5_moe_text": _OVQwen3_5ForCausalLM,
+    "qwen4_exp": _OVQwen4ExpForCausalLM,
+    "qwen4_exp_text": _OVQwen4ExpForCausalLM,
     "qwen3_omni_moe": _OVQwen3OmniMoeForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
     "videochat_flash_qwen": _OVVideoChatFlashQwenForCausalLM,

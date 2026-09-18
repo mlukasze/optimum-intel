@@ -473,6 +473,7 @@ MULTI_MODAL_TEXT_GENERATION_MODELS = [
     "qwen3_vl",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
     "got_ocr2",
     "gemma3",
     "gemma3n",
@@ -501,6 +502,7 @@ SSM_MODELS = [
     "qwen3_next",
     "qwen3_5_text",
     "qwen3_5_moe_text",
+    "qwen4_exp_text",
 ]
 
 # All transformers, diffusers, timm and sentence transformers models that were supported via optimum-onnx OnnxConfigs for which support is now removed

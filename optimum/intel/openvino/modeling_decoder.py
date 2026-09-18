@@ -1312,6 +1312,12 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
     This class supports stateful and stateless inference using OpenVINO.
     """
 
+    def get_experts_implementation(self):
+        return "openvino_impl"
+
+    def set_experts_implementation(self, experts_implementation):
+        return
+
     def __init__(
         self,
         model: openvino.Model,
@@ -1449,6 +1455,9 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
         self.request.wait()
         logits = torch.from_numpy(self.request.get_tensor("logits").data).to(self.device)
 
+        if not self.stateful and not use_cache:
+            return OVOutputWithMambaStates(logits=logits, cache_params=None)
+
         ssm_states = None
         conv_states = None
         key_cache = None
@@ -1543,6 +1552,7 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
                     "qwen3_next",
                     "qwen3_5_text",
                     "qwen3_5_moe_text",
+                    "qwen4_exp_text",
                 ]:
                     # LFM2, GraniteMoeHybrid (Granite-4.0) and Qwen3-Next require the attention mask
                     # to be the length of the full context, so default mask from OVModelForCausalLM needs to be used.
