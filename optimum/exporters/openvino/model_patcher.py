@@ -10083,7 +10083,18 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
             self._text_config = self._model.model.config
 
         class Qwen3_5DynamicCacheWrap(Qwen3_5DynamicCache):
-            def __init__(self, config, conv_states, recurrent_states, key_cache, value_cache):
+            def __init__(
+                self,
+                config,
+                conv_states,
+                recurrent_states,
+                key_cache,
+                value_cache,
+                indexer_cache=None,
+                ple_conv_cache=None,
+                ple_context_cache=None,
+                position_ids_cache=None,
+            ):
                 # Call parent constructor with all required arguments
                 super().__init__(config=config)
 
@@ -10096,7 +10107,12 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 self.recurrent_states = recurrent_states
                 self.key_cache = key_cache
                 self.value_cache = value_cache
-                self.indexer_cache = [None] * len(self.layer_types)
+                # `indexer_cache` is indexed by absolute layer_idx (like `key_cache`/`value_cache`
+                # are indexed by their own compacted `full_attn_mapping`), sparsely populated only
+                # at `qwen_sparse_attention` layer indices - see `update_indexer` below. Callers
+                # that have no QSA layers (plain Qwen3.5, Qwen3.5-MoE) never pass this in, so it
+                # stays an all-`None` list and `update_indexer` is simply never called for them.
+                self.indexer_cache = indexer_cache if indexer_cache is not None else [None] * len(self.layer_types)
                 self.full_attn_mapping = {}
                 self.linear_attn_mapping = {}
                 full_attn_layer_idx = 0
@@ -10108,6 +10124,37 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     elif self.layer_types[i] == "linear_attention":
                         self.linear_attn_mapping[i] = linear_attn_layer_idx
                         linear_attn_layer_idx += 1
+
+                # PLE's depthwise-conv / "previous context" states (conv_states indices 1, 2)
+                # are read/written by *unpatched* stock code via `Cache.update_conv_state` on
+                # `self.layers[layer_idx]`, so they must be seeded there directly (unlike the
+                # main conv/recurrent state above, which this wrap owns itself). No-op for
+                # models without PLE layers.
+                has_previous_state = self.get_seq_length() > 0
+                for cache, state_idx in ((ple_conv_cache, 1), (ple_context_cache, 2)):
+                    if not cache:
+                        continue
+                    for layer_idx, value in enumerate(cache):
+                        if value is None:
+                            continue
+                        layer = self.layers[layer_idx]
+                        # Widen state_idx=2 back to int64: stored int32 in the flat cache_params
+                        # contract, but stock code concatenates it against int64 token ids.
+                        layer.conv_states[state_idx] = value.to(torch.int64) if state_idx == 2 else value
+                        layer.is_conv_states_initialized[state_idx] = True
+                        layer.has_previous_state[state_idx] = has_previous_state
+                        layer.conv_kernel_size[state_idx] = value.shape[-1]
+
+                # Full accumulated position_ids: the QSA indexer needs full-history RoPE, so
+                # `Qwen4ExpTextModel.forward` stores/concatenates these onto
+                # `past_key_values.position_ids` every call (see its "We need the full
+                # position_ids in the indexer" comment) - seed it here since this wrap is
+                # reconstructed fresh every call. Kept as a regular external I/O tensor rather
+                # than OV state (see `add_past_key_values` in `model_configs.py`); stored
+                # float32 (batch, kv_len, 3) in cache_params, permuted+widened to the model's
+                # native int64 (3, batch, kv_len) layout. No-op for non-QSA models.
+                if position_ids_cache is not None:
+                    self.position_ids = position_ids_cache.permute(2, 0, 1).round().to(torch.int64)
 
             def update(
                 self,
@@ -10146,12 +10193,27 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     return 0
                 return self.key_cache[layer_idx].shape[-2]
 
-            def has_previous_state(self, layer_idx: Optional[int] = None, state_idx: Optional[int] = None) -> bool:
-                if state_idx == 2:
-                    return False
-                if layer_idx is None or layer_idx not in self.linear_attn_mapping:
-                    layer_idx = self.last_linear_layer
-                return self.conv_states[self.linear_attn_mapping[layer_idx]] is not None
+            def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+                """Returns (kv_length, kv_offset) based on the real `key_cache`/`value_cache` tensors.
+
+                The base `Cache.get_mask_sizes` relies on `self.layers[layer_idx]` (the newer per-layer
+                cache abstraction), which this wrap never populates - it manages `key_cache`/`value_cache`
+                as plain lists instead (see `update`/`get_seq_length` above). Left unoverridden, mask
+                creation silently ignores any already-accumulated past length, sizing the attention mask
+                as if `kv_length == query_length`, which then mismatches the real (past + new) key/value
+                length produced by `update()` once a non-empty cache is concatenated.
+
+                `kv_offset` is the absolute position at which the *kv range itself* starts, not the
+                number of already-seen tokens - mirroring stock `DynamicLayer.get_mask_sizes`, which
+                always returns `kv_offset=0` since this cache type never drops/slides old entries, so the
+                kv range always starts at absolute position 0 and grows to `kv_length`. Returning the past
+                length as `kv_offset` here (as a prior version of this override did) shifts the causal
+                mask's assumed kv start to the current query's absolute position, leaving only the very
+                first kv slot visible to any query - silently corrupting every decode step past the first.
+                """
+                kv_length = self.get_seq_length(layer_idx) + query_length
+                kv_offset = 0
+                return kv_length, kv_offset
 
         # the patch is needed to include KV-cache, Conv, and SSM states in the inputs and outputs.
         def patched_forward(
@@ -10168,6 +10230,7 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 layer_type in {"full_attention", "qwen_sparse_attention"} for layer_type in text_config.layer_types
             )
             num_linear_attn_layers = text_config.layer_types.count("linear_attention")
+            num_qsa_layers = text_config.layer_types.count("qwen_sparse_attention")
 
             if self._is_vlm and qsa_masks is None:
                 sequence_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
@@ -10211,8 +10274,52 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     key_cache.append(cache_params[2 * num_linear_attn_layers + 2 * idx])
                     value_cache.append(cache_params[2 * num_linear_attn_layers + 2 * idx + 1])
 
+                # QSA indexer key-history cache, one tensor per `qwen_sparse_attention` layer,
+                # appended after key/value pairs; sparsely placed back at its absolute layer_idx
+                # to match `Qwen3_5DynamicCacheWrap.update_indexer`'s direct-indexing contract.
+                # No-op (`num_qsa_layers == 0`) for every model other than Qwen4Exp.
+                indexer_cache = [None] * len(text_config.layer_types)
+                if num_qsa_layers:
+                    offset = 2 * num_linear_attn_layers + 2 * num_full_attn_layers
+                    qsa_layer_indices = [
+                        idx
+                        for idx, layer_type in enumerate(text_config.layer_types)
+                        if layer_type == "qwen_sparse_attention"
+                    ]
+                    for compact_idx, layer_idx in enumerate(qsa_layer_indices):
+                        indexer_cache[layer_idx] = cache_params[offset + compact_idx]
+
+                # PLE (n-gram embedding) state: one (short_conv, previous_context) pair per
+                # `ple_layer_ids` entry, appended after the indexer tensors; sparsely placed
+                # back at its absolute layer_idx to match `Qwen3_5DynamicCacheWrap`'s direct
+                # per-layer seeding contract. `ple_layer_ids` holds 1-based layer positions
+                # (see `modeling_qwen4_exp.Qwen4ExpTextDecoderLayer`). No-op for every model
+                # without PLE (`ple_layer_ids` empty).
+                ple_layer_ids = getattr(text_config, "ple_layer_ids", None) or []
+                ple_conv_cache = [None] * len(text_config.layer_types)
+                ple_context_cache = [None] * len(text_config.layer_types)
+                if ple_layer_ids:
+                    offset = 2 * num_linear_attn_layers + 2 * num_full_attn_layers + num_qsa_layers
+                    for compact_idx, one_based_layer_id in enumerate(ple_layer_ids):
+                        layer_idx = one_based_layer_id - 1
+                        ple_conv_cache[layer_idx] = cache_params[offset + 2 * compact_idx]
+                        ple_context_cache[layer_idx] = cache_params[offset + 2 * compact_idx + 1]
+
+                # Full (accumulated) position_ids, appended last (see
+                # `Qwen4ExpDummyPastKeyValuesGenerator`/`add_past_key_values`). Only present
+                # for QSA-equipped models (`num_qsa_layers > 0`); no-op otherwise.
+                position_ids_cache = cache_params[-1] if num_qsa_layers else None
+
                 wrapped_cache_params = Qwen3_5DynamicCacheWrap(
-                    text_config, conv_states, recurrent_states, key_cache, value_cache
+                    text_config,
+                    conv_states,
+                    recurrent_states,
+                    key_cache,
+                    value_cache,
+                    indexer_cache,
+                    ple_conv_cache,
+                    ple_context_cache,
+                    position_ids_cache,
                 )
 
             if self._is_vlm:
@@ -10257,6 +10364,27 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 for idx in range(num_full_attn_layers):
                     present_key_values.append(past_kv.key_cache[idx])
                     present_key_values.append(past_kv.value_cache[idx])
+
+                if num_qsa_layers:
+                    for idx, layer_type in enumerate(text_config.layer_types):
+                        if layer_type == "qwen_sparse_attention":
+                            present_key_values.append(past_kv.indexer_cache[idx])
+
+                if ple_layer_ids:
+                    for one_based_layer_id in ple_layer_ids:
+                        layer_idx = one_based_layer_id - 1
+                        present_key_values.append(past_kv.layers[layer_idx].conv_states[1])
+                        # Narrow back to `int32` (lossless - token ids always fit) to match the
+                        # `int32` cache_params contract - see `Qwen4ExpDummyPastKeyValuesGenerator`.
+                        present_key_values.append(past_kv.layers[layer_idx].conv_states[2].to(torch.int32))
+
+                if num_qsa_layers:
+                    # Permute back to the flat list's (batch, seq, 3) convention - seq as the
+                    # middle axis, matching the sibling `indexer` cache's layout (see
+                    # `add_past_key_values`/`Qwen3_5DynamicCacheWrap.__init__`) - and convert to
+                    # `float32` (lossless - position values are always exactly representable) to
+                    # match the cache_params contract.
+                    present_key_values.append(past_kv.position_ids.permute(1, 2, 0).to(torch.float32))
 
                 outputs["present_key_values"] = present_key_values
 
@@ -10692,118 +10820,335 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
                 sparse_moe_block.forward = sparse_moe_block._orig_forward
 
 
-def qwen4_exp_external_qsa_attention_forward(
+def qwen4_exp_traceable_qsa_indexer_forward(
     self,
     hidden_states: torch.Tensor,
     position_embeddings,
     attention_mask: torch.Tensor,
     past_key_values=None,
-    qsa_masks=None,
-    **kwargs,
-):
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb, repeat_kv
+) -> torch.Tensor:
+    """Trace-friendly, fully vectorized replacement for `Qwen4ExpTextQSAIndexer.forward`.
 
-    if qsa_masks is None:
-        return self._orig_forward(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            **kwargs,
-        )
+    Produces the same `[B, 1, S, KV]` selection mask as the stock nested-loop implementation
+    (validated bit-for-bit across seq-len/batch/topk-saturation/no-visible-block edge cases),
+    using only static-control-flow tensor ops (no `torch.nonzero`, no Python loop over
+    batch/query, no data-dependent shapes). This keeps the QSA block-selection logic inside the
+    exported IR instead of requiring it to be fed in as an external `qsa_masks` runtime input.
 
-    selected_token_mask = qsa_masks[self._qsa_mask_index]
-    if attention_mask.is_floating_point():
-        attention_mask = attention_mask + selected_token_mask
-    else:
-        attention_mask = attention_mask & selected_token_mask.bool()
+    Algorithm: pool+RMSNorm every candidate key block once (shared across all queries in this
+    call), apply RoPE using each block's cos/sin gathered directly from the caller's full-history
+    `position_embeddings` at the block's start position (exact for both text-only and VLM/2D
+    vision-grid positions - mirrors the stock reference's own per-block
+    `full_cos[batch_idx].index_select(0, group_starts)` gather), score all queries against all
+    blocks with a single batched matmul, mask out blocks that are not yet "complete and visible"
+    for a given query, `topk` over the (fixed-size) block dimension, then expand the selected
+    blocks back to token granularity and OR in the always-included ragged "tail" (the at-most-
+    `compress_ratio-1` most recent tokens that never formed a complete block) - computed
+    arithmetically from absolute query positions.
 
-    position_embeddings = tuple(x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
-    input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, self.head_dim)
-    query_states, gate = torch.chunk(
-        self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+    Restriction: assumes standard causal decoding with no padding holes in `attention_mask`
+    (query i sees exactly kv positions [0 .. cache_offset + i]), which covers the model's actual
+    generation task path (this is what makes `visible_token_indices` in the reference
+    implementation collapse from a data-dependent `torch.nonzero` to a plain `arange`).
+    """
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+    batch_size, seq_length, _ = hidden_states.shape
+    R = self.compress_ratio
+    hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
+    full_cos, full_sin = position_embeddings
+    current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
+
+    qk = self.index_qk_proj(hidden_states)
+    q, token_k = torch.split(
+        qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1
     )
-    gate = gate.reshape(*input_shape, -1)
-    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    q = q.reshape(*hidden_shape)
+    raw_keys = token_k.reshape(batch_size, seq_length, self.index_kv_heads, self.index_head_dim).squeeze(2)
+    q = self.q_layernorm(q)
+    q = apply_rotary_pos_emb(q, cos=current_cos, sin=current_sin, unsqueeze_dim=2)  # [B, S, Hn, D]
 
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     if past_key_values is not None:
-        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)  # [B, cache_len, D]
 
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-    key_length = key_states.shape[-2]
-    if attention_mask.shape[-1] < key_length:
-        attention_mask = F.pad(attention_mask, (key_length - attention_mask.shape[-1], 0), value=0.0)
-    else:
-        attention_mask = attention_mask[..., -key_length:]
-    if selected_token_mask.shape[-1] < key_length:
-        selected_token_mask = F.pad(selected_token_mask, (key_length - selected_token_mask.shape[-1], 0), value=0.0)
-    else:
-        selected_token_mask = selected_token_mask[..., -key_length:]
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-    attn_weights = attn_weights + attention_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(*input_shape, -1)
-    attn_output = attn_output * torch.sigmoid(gate)
-    return self.o_proj(attn_output), None
+    # `kv_length` must come from `attention_mask` (matching the stock reference exactly), not
+    # from the indexer's own accumulated cache: optimum-intel's dummy-export/validation passes
+    # populate `cache_params` (and hence `raw_keys` after `update_indexer`) and `attention_mask`
+    # independently, so their lengths are not guaranteed to agree during tracing even though they
+    # always do for real incremental decoding. `raw_keys` is reconciled to `kv_length` via a
+    # trailing slice, which is a no-op whenever the two already agree (the real-inference case).
+    kv_length = attention_mask.shape[-1]
+    past_seen_length = kv_length - seq_length
+    raw_keys = raw_keys[:, -kv_length:, :]
+
+    # `num_real_blocks` can legitimately be 0 (e.g. kv_length < R). `self.block_topk` extra
+    # "padding" blocks are always reserved via plain arithmetic - deliberately no Python
+    # `min`/`max`/comparison - because a shape-derived branch like that freezes to whichever
+    # formula the export dummy shape happened to trace, silently breaking every other runtime
+    # shape (confirmed: `max(num_real_blocks + 1, self.block_topk)` broke short prompts this
+    # way). Padding blocks are never selected (`block_valid` below excludes ids >= num_real_blocks),
+    # and `num_blocks_padded >= self.block_topk` always holds, so `topk`'s static `k` is safe -
+    # required since `torch.topk` has no dynamic-tensor-`k` overload.
+    num_real_blocks = kv_length // R
+    num_blocks_padded = num_real_blocks + self.block_topk
+    padded_len = num_blocks_padded * R
+    raw_keys_padded = F.pad(raw_keys, (0, 0, 0, padded_len - kv_length))
+
+    # ---- Pool + norm + RoPE all candidate blocks once, shared across every query ----
+    blocks = raw_keys_padded.reshape(batch_size, num_blocks_padded, R, self.index_head_dim)
+    pooled_keys = blocks.float().mean(dim=2).to(raw_keys.dtype)  # [B, nBlocksPad, D]
+    pooled_keys = self.k_layernorm(pooled_keys)
+    group_starts = torch.arange(num_blocks_padded, device=raw_keys.device) * R  # [nBlocksPad]
+    # Gather each block's RoPE cos/sin from `full_cos`/`full_sin` (the real accumulated position
+    # history, threaded via `cache_params.*.position_ids` - see `Qwen4ExpTextModel.forward`),
+    # mirroring the stock reference's `full_cos[batch_idx].index_select(0, group_starts)`.
+    # Recomputing block positions as plain sequential ints instead (an earlier version's
+    # approach) is exact for text-only input but silently wrong for VLM input, where a block can
+    # start inside an image span (non-sequential 2D positions) - confirmed as a ~0.09 max-logit
+    # divergence at VLM prefill, root-caused to this gather. Padding blocks (`group_starts >=
+    # kv_length`) are always masked out via `block_valid` below, so clamping them in-bounds here
+    # is safe.
+    group_starts_clamped = group_starts.clamp(max=kv_length - 1)
+    block_cos = full_cos.index_select(1, group_starts_clamped)  # [B, nBlocksPad, rope_dim]
+    block_sin = full_sin.index_select(1, group_starts_clamped)
+    block_key_states = apply_rotary_pos_emb(
+        pooled_keys.unsqueeze(2), cos=block_cos, sin=block_sin, unsqueeze_dim=2
+    ).squeeze(2)  # [B, nBlocksPad, D]
+
+    # ---- Batched scores: all queries x all blocks x all indexer-heads in one matmul ----
+    scores = torch.einsum("bshd,bnd->bshn", q.float(), block_key_states.float())
+    scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)  # [B, S, nBlocksPad], summed heads
+
+    # ---- Mask blocks that are not "complete and visible" for each query ----
+    q_abs = past_seen_length + torch.arange(seq_length, device=raw_keys.device)  # [S], absolute query positions
+    num_complete_blocks_per_query = (q_abs + 1) // R  # [S], always <= num_real_blocks
+    block_ids = torch.arange(num_blocks_padded, device=raw_keys.device)  # [nBlocksPad]
+    block_valid = block_ids.unsqueeze(0) < num_complete_blocks_per_query.unsqueeze(1)  # [S, nBlocksPad]
+    neg_inf = torch.finfo(scores.dtype).min
+    scores = torch.where(block_valid.unsqueeze(0), scores, torch.full_like(scores, neg_inf))
+
+    # ---- TopK over the (fixed-size, always >= self.block_topk) block dimension ----
+    # `num_blocks_padded >= self.block_topk` is guaranteed unconditionally above, so `k` is a
+    # plain static int, always valid - no data-dependent `min()` (see the padding comment above
+    # for why that would silently bake in a runtime-invalid `k` for the exported graph).
+    top_scores, top_block_idx = scores.topk(self.block_topk, dim=-1)  # [B, S, k]
+    top_valid = top_scores > neg_inf / 2  # guards against selecting masked-out (-inf) blocks
+
+    # ---- Block -> token expansion: token t belongs to block t // R ----
+    token_ids = torch.arange(kv_length, device=raw_keys.device)  # [KV]
+    token_block_ids = token_ids // R  # [KV], always < num_blocks_padded
+    # Scattered as int32 rather than bool: OpenVINO's GPU plugin has no supported layout for a
+    # `ScatterElementsUpdate` over a `u8`(bool)-typed tensor (confirmed via direct repro -
+    # `[GPU] No layout format available for scatterelementsupdate ... data_type=u8`), while
+    # CPU handles it fine either way. int32 scatters correctly on both CPU and GPU; converted
+    # back to bool immediately after via `index_select`, so the outward semantics are unchanged.
+    selected_by_block_mask = torch.zeros(
+        batch_size, seq_length, num_blocks_padded, dtype=torch.int32, device=raw_keys.device
+    )
+    selected_by_block_mask = selected_by_block_mask.scatter(-1, top_block_idx, top_valid.to(torch.int32))
+    selected_by_token_from_block = selected_by_block_mask.index_select(-1, token_block_ids).bool()  # [B, S, KV]
+
+    # ---- Tail: always-included ragged remainder for each query, computed arithmetically ----
+    tail_start_per_query = num_complete_blocks_per_query * R  # [S]
+    tail_mask = (token_ids.view(1, kv_length) >= tail_start_per_query.view(seq_length, 1)) & (
+        token_ids.view(1, kv_length) <= q_abs.view(seq_length, 1)
+    )  # [S, KV]
+    tail_mask = tail_mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+    selected_token_mask = (selected_by_token_from_block | tail_mask).unsqueeze(1)  # [B, 1, S, KV]
+    if attention_mask.is_floating_point():
+        min_dtype = torch.finfo(attention_mask.dtype).min
+        selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
+    return selected_token_mask
 
 
-class _Qwen4ExpIndexerCache:
-    def __init__(self, indexer_keys: torch.Tensor, cache_position: torch.Tensor):
-        self.indexer_keys = indexer_keys
-        self.cache_position = cache_position.reshape(-1).to(device=indexer_keys.device, dtype=torch.long)
+def qwen4_exp_traceable_shift_right_ignore_eos(
+    self, token_ids: torch.Tensor, shift: int
+) -> torch.Tensor:
+    """Traceable replacement for `Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos`.
 
-    def update_indexer(self, indexer_key_states: torch.Tensor, layer_idx: int):
-        self.indexer_keys = self.indexer_keys.index_copy(1, self.cache_position, indexer_key_states)
-        return self.indexer_keys
+    The reference implementation calls `torch.cummax`, which OpenVINO's PyTorch frontend
+    cannot convert ("No conversion rule found for operations: aten::cummax"). The inclusive
+    running max over dim=1 is instead computed as a masked reduce-max over a static causal
+    (lower-triangular) matrix, which is bit-exact with `torch.cummax` (validated over randomized
+    inputs, including all-eos/no-eos edge cases) but only uses ops OpenVINO already supports.
+    """
+    if shift == 0:
+        return token_ids
+    batch_size, seq_len = token_ids.shape
+    positions = torch.arange(seq_len, device=token_ids.device, dtype=torch.long)
+    eos_positions = torch.where(token_ids == self.eos_token_id, positions, -1)
+    causal = positions.unsqueeze(0) <= positions.unsqueeze(1)  # [i, j] True iff j <= i
+    expanded = eos_positions.unsqueeze(1).expand(batch_size, seq_len, seq_len)  # [b, i, j] = eos_positions[b, j]
+    masked = torch.where(causal.unsqueeze(0), expanded, expanded.new_full((), -1))
+    previous_eos_inclusive = masked.max(dim=-1).values
+    previous_eos = torch.cat([eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]], dim=1)
+    segment_start = previous_eos + 1
+    position_in_segment = positions.unsqueeze(0) - segment_start
+    source_positions = positions - shift
+    gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
+    shifted = token_ids.gather(dim=1, index=gather_positions)
+    valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
+    return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
 
 
-class Qwen4ExpQSAIndexerModel(nn.Module):
-    """Standalone QSA graph with an explicit fixed-size growing indexer cache."""
+_QWEN4_EXP_HASH_LIMB_BITS = 12
+_QWEN4_EXP_HASH_LIMB_MASK = (1 << _QWEN4_EXP_HASH_LIMB_BITS) - 1
+# A raw partial product `token (<=~18 bits) * one 12-bit multiplier limb` is at most ~30 bits,
+# i.e. spans at most 3 limb slots (bits [0:12), [12:24), [24:30)) once split into 12-bit pieces.
+_QWEN4_EXP_HASH_SPREAD_LIMBS = 3
 
-    def __init__(self, indexer: nn.Module):
-        super().__init__()
-        self.indexer = indexer
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings_cos: torch.Tensor,
-        position_embeddings_sin: torch.Tensor,
-        attention_mask: torch.Tensor,
-        past_indexer_keys: torch.Tensor,
-        cache_position: torch.Tensor,
-    ):
-        cache = _Qwen4ExpIndexerCache(past_indexer_keys, cache_position)
-        selected_mask = self.indexer(
-            hidden_states,
-            (position_embeddings_cos, position_embeddings_sin),
-            attention_mask,
-            cache,
+def _qwen4_exp_decompose_int_to_limbs(value: int, num_limbs: int) -> list:
+    """Splits a (possibly >32-bit) Python int into little-endian 12-bit limbs, using Python's
+    native arbitrary-precision integers - safe because this runs at patch/trace time on a plain
+    Python int, never inside the traced graph (see `qwen4_exp_traceable_ngram_embedding_forward`
+    for why that distinction matters)."""
+    return [(value >> (_QWEN4_EXP_HASH_LIMB_BITS * i)) & _QWEN4_EXP_HASH_LIMB_MASK for i in range(num_limbs)]
+
+
+def _qwen4_exp_clean_limbs_of_product(token_i32: torch.Tensor, mult_limbs_const: torch.Tensor) -> list:
+    """Computes the exact big-integer product `token * multiplier` (with `multiplier` given
+    pre-decomposed as `mult_limbs_const`, little-endian 12-bit limbs) as a clean (carry-
+    propagated, non-overlapping) list of little-endian 12-bit-limb int32 tensors - using only
+    additions/multiplications that stay far below 2**31, which is safe on OpenVINO's CPU plugin
+    (see `qwen4_exp_traceable_ngram_embedding_forward` for the full rationale).
+
+    `token_i32`: (batch, seq) int32, values < vocab_size (always << 2**18).
+    `mult_limbs_const`: (num_mult_limbs,) int32 constant, little-endian 12-bit limbs.
+    Returns `num_mult_limbs + _QWEN4_EXP_HASH_SPREAD_LIMBS` little-endian (batch, seq) int32
+    tensors.
+    """
+    num_mult_limbs = mult_limbs_const.shape[0]
+    num_clean_limbs = num_mult_limbs + _QWEN4_EXP_HASH_SPREAD_LIMBS
+    raw = [token_i32 * mult_limbs_const[k] for k in range(num_mult_limbs)]  # each <= ~2**30
+    acc = [torch.zeros_like(token_i32) for _ in range(num_clean_limbs)]
+    for k in range(num_mult_limbs):
+        v = raw[k]
+        acc[k] = acc[k] + (v & _QWEN4_EXP_HASH_LIMB_MASK)
+        acc[k + 1] = acc[k + 1] + ((v >> _QWEN4_EXP_HASH_LIMB_BITS) & _QWEN4_EXP_HASH_LIMB_MASK)
+        acc[k + 2] = acc[k + 2] + ((v >> (2 * _QWEN4_EXP_HASH_LIMB_BITS)) & _QWEN4_EXP_HASH_LIMB_MASK)
+    carry = torch.zeros_like(token_i32)
+    clean = []
+    for k in range(num_clean_limbs):
+        total = acc[k] + carry
+        clean.append(total & _QWEN4_EXP_HASH_LIMB_MASK)
+        carry = total >> _QWEN4_EXP_HASH_LIMB_BITS
+    return clean
+
+
+def _qwen4_exp_mod_small(limbs: list, modulus: int) -> torch.Tensor:
+    """Reduces a big integer (given as little-endian 12-bit-limb int32 tensors) modulo a small
+    Python-int `modulus`, via bit-by-bit binary "double-and-reduce": every intermediate value
+    stays strictly below `2 * modulus`, avoiding OpenVINO's separately unreliable `Remainder`/
+    `FloorMod` kernel for larger operands entirely (see
+    `qwen4_exp_traceable_ngram_embedding_forward` for the full rationale)."""
+    r = torch.zeros_like(limbs[0])
+    mod_t = torch.full_like(limbs[0], modulus)
+    for i in reversed(range(len(limbs) * _QWEN4_EXP_HASH_LIMB_BITS)):
+        limb_idx, bit_idx = divmod(i, _QWEN4_EXP_HASH_LIMB_BITS)
+        bit = (limbs[limb_idx] >> bit_idx) & 1
+        r = r * 2 + bit
+        ge = (r >= mod_t).to(r.dtype)
+        r = r - ge * mod_t
+    return r
+
+
+def qwen4_exp_traceable_ngram_embedding_forward(self, input_ids: torch.Tensor, past_key_values) -> torch.Tensor:
+    """Traceable, numerically-safe replacement for `Qwen4ExpTextNGramEmbedding.forward`.
+
+    The reference multiplies token ids by large int64 `layer_multipliers`, XORs several
+    products together, then reduces modulo small per-head vocab sizes via `torch.remainder`.
+    OpenVINO's CPU-plugin Eltwise kernels silently truncate int64 to 32 bits on overflow (e.g.
+    `46341 ** 2` already overflows this way), and `Remainder`/`FloorMod` is separately
+    unreliable for some int32 magnitudes too - confirmed via layer-by-layer comparison as the
+    sole divergence source for the whole model once exported to OpenVINO IR.
+
+    This replacement decomposes each multiplier into small (12-bit) limbs (precomputed in
+    Python at patch time - arbitrary precision, unaffected by the runtime bug), multiplies and
+    carry-propagates them using only small-magnitude additions, XORs limb-wise (exact: aligned
+    power-of-2 bit slices never interact), then reduces modulo each vocab size via a bit-by-bit
+    "double-and-reduce" algorithm instead of `torch.remainder`. Every intermediate value stays
+    far below 2**31. Bit-exact vs. the reference in eager PyTorch, and - unlike the reference -
+    also bit-exact once exported to OpenVINO IR.
+    """
+    input_ids = input_ids.long()
+    # `previous_context` is read *unconditionally* from `conv_states[2]` with a constant
+    # `+ eos_token_id` offset, instead of the reference's `has_previous_state`-gated branch:
+    # that Python-level bool freezes to one fixed outcome once traced for export, so the graph
+    # would always take whichever branch was true during the export dummy trace - even on a
+    # real first call, where OV's stateful convention zero-initializes `conv_states[2]`
+    # (`stateful.py::build_state_initializer`), not `eos_token_id` as the reference's "no
+    # previous context" default requires (confirmed: only the first `context_len` positions of
+    # the very first forward call diverged).
+    #
+    # Storing `token_id - eos_token_id` on write / `+ eos_token_id` on read is exact for every
+    # real cache entry (`update_conv_state`'s concat+slice bookkeeping commutes with a constant
+    # offset), and makes a never-written (zero) slot read back as `eos_token_id` too - matching
+    # the reference default with no data-dependent branching, including for a short first call
+    # (its zero-padding fallback becomes `eos_token_id` under this offset, making the
+    # reference's separate explicit pad redundant).
+    if past_key_values is not None:
+        previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone().long() + self.eos_token_id
+        _ = past_key_values.update_conv_state(
+            input_ids - self.eos_token_id, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
         )
-        return selected_mask, cache.indexer_keys
+    else:
+        previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
 
+    token_history = torch.cat([previous_context, input_ids], dim=-1)
+    shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
 
-def make_qwen4_exp_qsa_indexer_model(model: PreTrainedModel, layer_idx: int) -> Qwen4ExpQSAIndexerModel:
-    """Return the standalone exportable QSA graph for one sparse-attention layer."""
-    text_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
-    return Qwen4ExpQSAIndexerModel(text_model.layers[layer_idx].self_attn.indexer)
+    limb_lists = [
+        _qwen4_exp_clean_limbs_of_product(
+            shifted_tokens[position].to(torch.int32), self._qwen4_exp_layer_multiplier_limbs[position]
+        )
+        for position in range(self.ngram_size)
+    ]
+
+    blocks = []
+    for ngram in range(2, self.ngram_size + 1):
+        start_idx = (ngram - 2) * self.heads_per_ngram
+        end_idx = start_idx + self.heads_per_ngram
+        mixed_limbs = limb_lists[0]
+        for position in range(1, ngram):
+            mixed_limbs = [a ^ b for a, b in zip(mixed_limbs, limb_lists[position])]
+        head_results = []
+        for head_idx in range(start_idx, end_idx):
+            modulus = self._qwen4_exp_head_vocab_sizes_py[head_idx]
+            offset = self._qwen4_exp_head_offsets_py[head_idx]
+            reduced = _qwen4_exp_mod_small(mixed_limbs, modulus)
+            head_results.append(reduced.to(torch.int64) + offset)
+        blocks.append(torch.stack(head_results, dim=-1))
+
+    ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1] :]
+    execution_device = (
+        self.ngram_embedding.weight.device if self.ngram_embedding.weight.device.type != "meta" else None
+    )
+    return self.ngram_embedding(ngram_ids.to(execution_device)).to(ngram_ids.device).flatten(-2)
 
 
 class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
-    """Initial export boundary for Qwen4Exp-specific cache and QSA handling."""
+    """Initial export boundary for Qwen4Exp-specific cache and QSA handling.
+
+    Reuses `Qwen3_5ModelPatcher.__init__` unchanged: its `Qwen3_5DynamicCacheWrap` and
+    `patched_forward` already wire per-QSA-layer indexer key-history into the same stateful
+    `cache_params` contract used for every other per-layer state (see the `indexer_cache`/
+    `update_indexer`/`qwen_sparse_attention` handling there, which is a no-op for every other
+    model built on top of it since none declare a `qwen_sparse_attention` layer type). The only
+    Qwen4Exp-specific piece is monkeypatching the QSA layers' `.indexer.forward` (below) so the
+    indexer itself runs the traceable vectorized algorithm and calls `past_key_values.
+    update_indexer(...)` instead of the eager nested-loop/`torch.nonzero` original - removing the
+    need for an external `qsa_masks` runtime input entirely. `ple_embedding.forward` is likewise
+    replaced (see `qwen4_exp_traceable_ngram_embedding_forward`) to route its large-int64 hash
+    computation through an int32-limb-safe algorithm, working around an OpenVINO CPU-plugin
+    integer-precision bug in large-magnitude int64 Eltwise ops.
+    """
 
     def __enter__(self):
         from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 
         super().__enter__()
-        sparse_index = 0
         for decoder_layer in self._text_model.layers:
             if isinstance(decoder_layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 decoder_layer.mlp._orig_forward = decoder_layer.mlp.forward
@@ -10811,11 +11156,31 @@ class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
                     patched_qwen3_5_moe_sparse_moe_block, decoder_layer.mlp
                 )
             if getattr(decoder_layer, "layer_type", None) == "qwen_sparse_attention":
-                attention = decoder_layer.self_attn
-                attention._orig_forward = attention.forward
-                attention._qsa_mask_index = sparse_index
-                attention.forward = types.MethodType(qwen4_exp_external_qsa_attention_forward, attention)
-                sparse_index += 1
+                indexer = decoder_layer.self_attn.indexer
+                indexer._orig_forward = indexer.forward
+                indexer.forward = types.MethodType(qwen4_exp_traceable_qsa_indexer_forward, indexer)
+            if getattr(decoder_layer, "ple", None) is not None:
+                ngram_embedding = decoder_layer.ple.ple_embedding
+                ngram_embedding._orig_shift_right_ignore_eos = ngram_embedding._shift_right_ignore_eos
+                ngram_embedding._shift_right_ignore_eos = types.MethodType(
+                    qwen4_exp_traceable_shift_right_ignore_eos, ngram_embedding
+                )
+                ngram_embedding._orig_forward = ngram_embedding.forward
+                multipliers_py = [int(m) for m in ngram_embedding.layer_multipliers.tolist()]
+                num_mult_limbs = max(
+                    1,
+                    (max(multipliers_py).bit_length() + _QWEN4_EXP_HASH_LIMB_BITS - 1)
+                    // _QWEN4_EXP_HASH_LIMB_BITS,
+                )
+                ngram_embedding._qwen4_exp_layer_multiplier_limbs = torch.tensor(
+                    [_qwen4_exp_decompose_int_to_limbs(m, num_mult_limbs) for m in multipliers_py],
+                    dtype=torch.int32,
+                )
+                ngram_embedding._qwen4_exp_head_vocab_sizes_py = ngram_embedding.ngram_heads_vocab_sizes.tolist()
+                ngram_embedding._qwen4_exp_head_offsets_py = ngram_embedding.ngram_heads_offsets.tolist()
+                ngram_embedding.forward = types.MethodType(
+                    qwen4_exp_traceable_ngram_embedding_forward, ngram_embedding
+                )
 
     def __exit__(self, exc_type, exc_value, traceback):
         from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
@@ -10823,8 +11188,16 @@ class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
         for decoder_layer in self._text_model.layers:
             if isinstance(decoder_layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 decoder_layer.mlp.forward = decoder_layer.mlp._orig_forward
-            if hasattr(decoder_layer, "self_attn") and hasattr(decoder_layer.self_attn, "_orig_forward"):
-                decoder_layer.self_attn.forward = decoder_layer.self_attn._orig_forward
+            if getattr(decoder_layer, "layer_type", None) == "qwen_sparse_attention":
+                indexer = decoder_layer.self_attn.indexer
+                if hasattr(indexer, "_orig_forward"):
+                    indexer.forward = indexer._orig_forward
+            if getattr(decoder_layer, "ple", None) is not None:
+                ngram_embedding = decoder_layer.ple.ple_embedding
+                if hasattr(ngram_embedding, "_orig_shift_right_ignore_eos"):
+                    ngram_embedding._shift_right_ignore_eos = ngram_embedding._orig_shift_right_ignore_eos
+                if hasattr(ngram_embedding, "_orig_forward"):
+                    ngram_embedding.forward = ngram_embedding._orig_forward
         super().__exit__(exc_type, exc_value, traceback)
 
 

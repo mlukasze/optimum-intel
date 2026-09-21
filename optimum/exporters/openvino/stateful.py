@@ -288,15 +288,42 @@ def patch_stateful_hybrid_ssm(ov_model: ov.Model):
                 other_tensors.append(ov_tensor)
         return kv_names, ssm_names, other_tensors
 
-    ssm_prefix_input_names = ["cache_params.past.ssm", "cache_params.past.conv"]
-    kv_prefix_input_names = ["cache_params.past.key", "cache_params.past.value"]
+    # `ple_conv`/`ple_context` (qwen4_exp PLE n-gram embedding state) are fixed-size,
+    # in-place-replaced per call just like `ssm`/`conv`, so they belong in the same bucket.
+    ssm_prefix_input_names = [
+        "cache_params.past.ssm",
+        "cache_params.past.conv",
+        "cache_params.past.ple_conv",
+        "cache_params.past.ple_context",
+    ]
+    # `indexer` (QSA sparse-attention cache, qwen4_exp) behaves like a kv cache: it grows by
+    # concatenation along the sequence dim and is reordered along the batch dim during beam
+    # search, so it belongs in the same "kv-like" bucket rather than the ssm/conv one.
+    # `position_ids` (same growth pattern) is deliberately *not* listed here - see its
+    # `add_past_key_values` declaration in `model_configs.py`: a hidden OV state hits a
+    # CPU-plugin limitation for this tensor, so it stays a regular external input/output pair.
+    kv_prefix_input_names = [
+        "cache_params.past.key",
+        "cache_params.past.value",
+        "cache_params.past.indexer",
+    ]
     kv_input_names, ssm_input_names, not_cache_inputs = get_kv_ssm_tensor_names(
         ssm_prefix_input_names, kv_prefix_input_names, ov_model.inputs
     )
     cache_inputs = kv_input_names + ssm_input_names
 
-    ssm_prefix_output_names = ["cache_params.present.ssm", "cache_params.present.conv"]
-    kv_prefix_output_names = ["cache_params.present.key", "cache_params.present.value"]
+    ssm_prefix_output_names = [
+        "cache_params.present.ssm",
+        "cache_params.present.conv",
+        "cache_params.present.ple_conv",
+        "cache_params.present.ple_context",
+    ]
+    kv_prefix_output_names = [
+        "cache_params.present.key",
+        "cache_params.present.value",
+        "cache_params.present.indexer",
+        # `position_ids` intentionally excluded - see `kv_prefix_input_names` above.
+    ]
     kv_output_names, ssm_output_names, _ = get_kv_ssm_tensor_names(
         ssm_prefix_output_names, kv_prefix_output_names, ov_model.outputs
     )

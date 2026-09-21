@@ -2049,25 +2049,80 @@ class Qwen3_5DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
 
 
 class Qwen4ExpDummyPastKeyValuesGenerator(Qwen3_5DummyPastKeyValuesGenerator):
+    """
+    Generates dummy cache_params inputs for Qwen4Exp: conv/ssm pairs for linear-attention
+    layers, then key/value pairs for full- and QSA-attention layers (both cache identically),
+    then one indexer-key-history tensor per QSA layer, then a (short_conv, previous_context)
+    pair per PLE-equipped layer (both appended last, matching the layout built by
+    `Qwen4ExpModelPatcher`'s `patched_forward`).
+
+    The PLE (n-gram embedding) mechanism reuses the generic `conv_states` cache slots (index 1
+    for its short depthwise conv, index 2 for its "previous context" token history - see
+    `Qwen4ExpTextPLELayer`/`Qwen4ExpTextNGramEmbedding` in the modeling code) to carry state
+    across calls. Unlike the main conv/ssm state (index 0, handled by the traced
+    `qwen3_5_gated_delta_net_forward` patch directly on the flat cache lists), these two slots
+    are read/written by *unpatched* stock model code via `Cache.update_conv_state`/
+    `has_previous_state`, which delegate to the real per-layer `self.layers[idx]` cache object -
+    so they must be threaded through `Qwen3_5DynamicCacheWrap` explicitly (see `ple_conv_cache`/
+    `ple_context_cache` there) rather than piggy-backing on the flat-list mechanism used for
+    index 0.
+    """
+
     def __init__(self, task, normalized_config, **kwargs):
         super().__init__(task=task, normalized_config=normalized_config, **kwargs)
+        config = normalized_config.config
         self.num_full_attn_layers = sum(
-            layer_type in {"full_attention", "qwen_sparse_attention"}
-            for layer_type in normalized_config.config.layer_types
+            layer_type in {"full_attention", "qwen_sparse_attention"} for layer_type in config.layer_types
         )
+        self.num_qsa_layers = config.layer_types.count("qwen_sparse_attention")
+        self.indexer_head_dim = config.indexer_head_dim
+        self.ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
+        if self.ple_layer_ids:
+            self.ple_short_conv_len = (config.ple_conv_kernel_size - 1) * config.ngram_size
+            self.ple_context_len = config.ngram_size - 1
+            self.ple_hc_hidden_size = config.hidden_size * config.hc_count
+            eos_token_id = config.eos_token_id
+            self.ple_eos_token_id = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
 
-
-class Qwen4ExpQSAMaskInputGenerator(DummyInputGenerator):
-    SUPPORTED_INPUT_NAMES = ("qsa_masks",)
-
-    def __init__(self, task, normalized_config, batch_size=DEFAULT_DUMMY_SHAPES["batch_size"], sequence_length=DEFAULT_DUMMY_SHAPES["sequence_length"], **kwargs):
-        self.batch_size = batch_size
-        self.sequence_length = sequence_length
-        self.num_sparse_layers = normalized_config.config.layer_types.count("qwen_sparse_attention")
-
-    def generate(self, input_name, framework="pt", int_dtype="int64", float_dtype="fp32"):
-        shape = (self.num_sparse_layers, self.batch_size, 1, self.sequence_length, self.sequence_length)
-        return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        cache_params = super().generate(input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype)
+        for _ in range(self.num_qsa_layers):
+            indexer_key_shape = (self.batch_size, self.sequence_length, self.indexer_head_dim)
+            cache_params.append(self.random_float_tensor(indexer_key_shape, framework=framework, dtype=float_dtype))
+        for _ in self.ple_layer_ids:
+            short_conv_shape = (self.batch_size, self.ple_hc_hidden_size, self.ple_short_conv_len)
+            cache_params.append(self.random_float_tensor(short_conv_shape, framework=framework, dtype=float_dtype))
+            # Token-id history (not hidden state): "cold start" filled with `eos_token_id`,
+            # matching `Qwen4ExpTextNGramEmbedding`'s own fresh-cache convention. Declared
+            # `int32` (not `torch.long`) because the CPU plugin's oneDNN beam-reorder `Gather`
+            # fails to compile for a dynamically-broadcast-initialized stateful `int64` variable;
+            # token ids always fit in int32, so this is a lossless storage-only narrowing -
+            # `Qwen3_5DynamicCacheWrap` widens back to `int64` before the stock PLE code needs it.
+            previous_context = torch.full(
+                (self.batch_size, self.ple_context_len), self.ple_eos_token_id, dtype=torch.int32
+            )
+            cache_params.append(previous_context)
+        if self.num_qsa_layers:
+            # The QSA indexer needs full accumulated position_ids for RoPE over the whole cached
+            # key history (see `Qwen4ExpTextModel.forward`'s `past_key_values.position_ids`
+            # accumulation), threaded through the flat cache_params list like any other growing
+            # cache tensor - permuted to `(batch, seq, 3)` here, back to native `(3, batch, seq)`
+            # in `Qwen3_5DynamicCacheWrap`.
+            #
+            # Declared `float32` rather than int: even after narrowing to int32, a *growing*
+            # stateful variable initialized via dynamic `Broadcast` fails at inference with a
+            # "descriptor incompatible with provided dimensions" error once its size-0 axis
+            # becomes non-zero (reproduced regardless of which axis grows). The other growing
+            # cache tensors (`key`/`value`/`indexer`) are float32 and unaffected, so this matches
+            # them; position values are always exactly representable in float32, so the
+            # int64->float32->int64 round-trip is lossless.
+            position_ids_shape = (self.batch_size, self.sequence_length, 3)
+            cache_params.append(
+                self.random_int_tensor(position_ids_shape, min_value=0, max_value=127, framework=framework).to(
+                    torch.float32
+                )
+            )
+        return cache_params
 
 
 class Qwen3_5MTPDummyInputGenerator(DummyTextInputGenerator):

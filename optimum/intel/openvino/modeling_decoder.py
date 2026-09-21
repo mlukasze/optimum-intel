@@ -901,6 +901,8 @@ class OVModelForCausalLM(OVBaseDecoderModel, GenerationMixin):
             init_cls = OVGPTBigCodeForCausalLM
         elif model_type == "phi3":
             init_cls = OVPhi3ForCausalLM
+        elif model_type == "qwen4_exp_text":
+            init_cls = OVModelForQwen4Exp
         elif model_type in SSM_MODELS:
             init_cls = OVModelWithMambaForCausalLM
         else:
@@ -1149,7 +1151,10 @@ class OVCacheWithMambaStates(MambaCache):
         self.mamba_d_conv = getattr(config, "mamba_d_conv", None)
         self.mamba_expand = getattr(config, "mamba_expand", None)
         self.mamba_d_state = getattr(config, "mamba_d_state", None)
-        self.intermediate_size = config.intermediate_size
+        # MoE-style hybrid configs (e.g. qwen4_exp_text) expose `moe_intermediate_size` instead;
+        # only consumed below when default (zero) states are built from scratch, never once
+        # real inference output states are supplied.
+        self.intermediate_size = getattr(config, "intermediate_size", None)
         self.conv_kernel_size = getattr(
             config, "conv_kernel", getattr(config, "mamba_d_conv", getattr(config, "conv_L_cache", None))
         )
@@ -1581,6 +1586,56 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
             }
         )
         return model_inputs
+
+
+class OVModelForQwen4Exp(OVModelWithMambaForCausalLM):
+    """Qwen4Exp (QSA / hybrid-attention) variant of `OVModelWithMambaForCausalLM`.
+
+    Every cache tensor is internal OV state except the QSA indexer's accumulated
+    `cache_params.*.position_ids` (kept as a plain external I/O pair, see
+    `Qwen4ExpTextOpenVINOConfig.add_past_key_values`). This subclass threads that tensor across
+    calls and fills the 2D `position_ids` input the Mamba-oriented base class never populates.
+    """
+
+    _QSA_POSITION_IDS_INPUT = "cache_params.past.position_ids"
+    _QSA_POSITION_IDS_OUTPUT = "cache_params.present.position_ids"
+
+    @property
+    def _has_qsa_position_ids(self):
+        return self._QSA_POSITION_IDS_INPUT in self.input_names
+
+    def prepare_inputs(
+        self, input_ids, attention_mask=None, cache_params=None, use_cache=None, cache_position=None, **kwargs
+    ):
+        inputs = super().prepare_inputs(input_ids, attention_mask, cache_params, use_cache, cache_position, **kwargs)
+
+        if "position_ids" in self.input_names and "position_ids" not in inputs:
+            # Base class only fills `cache_position`; this hybrid config's non-QSA layers also
+            # need a real 2D `position_ids`, computed the same way `OVModelForCausalLM` does.
+            attn_np = np.asarray(inputs["attention_mask"])
+            position_ids_2d = np.cumsum(attn_np, axis=1) - 1
+            position_ids_2d[attn_np == 0] = 1
+            if cache_params is not None:
+                position_ids_2d = position_ids_2d[:, -input_ids.shape[1] :]
+            inputs["position_ids"] = position_ids_2d
+
+        if not self._has_qsa_position_ids:
+            return inputs
+
+        batch_size = input_ids.shape[0]
+        if cache_params is None:  # new sequence: mirrors the base class's own state reset
+            self._qsa_position_ids_cache = np.zeros((batch_size, 0, 3), dtype=np.float32)
+
+        inputs[self._QSA_POSITION_IDS_INPUT] = getattr(self, "_qsa_position_ids_cache", None)
+        if inputs[self._QSA_POSITION_IDS_INPUT] is None:  # raw forward() call, cache never reset
+            inputs[self._QSA_POSITION_IDS_INPUT] = np.zeros((batch_size, 0, 3), dtype=np.float32)
+        return inputs
+
+    def forward(self, *args, **kwargs):
+        outputs = super().forward(*args, **kwargs)
+        if self._has_qsa_position_ids:
+            self._qsa_position_ids_cache = self.request.get_tensor(self._QSA_POSITION_IDS_OUTPUT).data.copy()
+        return outputs
 
 
 class OVMambaForCausalLM(OVModelWithMambaForCausalLM):

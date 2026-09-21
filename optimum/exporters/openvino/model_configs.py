@@ -104,7 +104,6 @@ from optimum.exporters.openvino.input_generators import (
     OVMiniCPM3DummyPastKeyValuesGenerator,
     PooledProjectionsDummyInputGenerator,
     Qwen3_5DummyPastKeyValuesGenerator,
-    Qwen4ExpQSAMaskInputGenerator,
     Qwen4ExpDummyPastKeyValuesGenerator,
     Qwen3_5MTPDummyInputGenerator,
     Qwen3ASRDummySeq2SeqPastKeyValuesGenerator,
@@ -7402,11 +7401,9 @@ class Qwen3_5OpenVINOConfig(Qwen3VLOpenVINOConfig):
 class Qwen4ExpTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
     MIN_TRANSFORMERS_VERSION = "5.16.0"
     MAX_TRANSFORMERS_VERSION = "5.99.99"
-    include_qsa_masks = True
     DUMMY_INPUT_GENERATOR_CLASSES = (
         DummyTextInputGenerator,
         Qwen4ExpDummyPastKeyValuesGenerator,
-        Qwen4ExpQSAMaskInputGenerator,
     )
     DUMMY_PKV_GENERATOR_CLASS = Qwen4ExpDummyPastKeyValuesGenerator
     _MODEL_PATCHER = Qwen4ExpModelPatcher
@@ -7423,6 +7420,7 @@ class Qwen4ExpTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
             for layer_type in self._normalized_config.layer_types
         )
         num_linear_attn_layers = self._normalized_config.layer_types.count("linear_attention")
+        num_qsa_layers = self._normalized_config.layer_types.count("qwen_sparse_attention")
         for index in range(num_linear_attn_layers):
             inputs_or_outputs[f"{cache_name_prefix}.conv.{index}"] = {0: "batch_size"}
             inputs_or_outputs[f"{cache_name_prefix}.ssm.{index}"] = {0: "batch_size"}
@@ -7435,18 +7433,41 @@ class Qwen4ExpTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
                 0: "batch_size",
                 2: decoder_sequence_name,
             }
-
-    @property
-    def inputs(self) -> Dict[str, Dict[int, str]]:
-        inputs = super().inputs
-        if self.include_qsa_masks:
-            inputs["qsa_masks"] = {
-                0: "num_sparse_layers",
-                1: "batch_size",
-                3: "sequence_length",
-                4: "past_sequence_length + sequence_length",
+        for index in range(num_qsa_layers):
+            # QSA indexer key history: [batch_size, kv_len, indexer_head_dim] (single-head, no
+            # separate "value" side - see `qwen4_exp_traceable_qsa_indexer_forward`).
+            inputs_or_outputs[f"{cache_name_prefix}.indexer.{index}"] = {
+                0: "batch_size",
+                1: decoder_sequence_name,
             }
-        return inputs
+        ple_layer_ids = getattr(self._normalized_config, "ple_layer_ids", None) or []
+        for index in range(len(ple_layer_ids)):
+            # PLE (n-gram embedding) state: a short depthwise-conv window and a small
+            # "previous context" token-id history, both fixed-size like `.conv.`/`.ssm.` above
+            # (not growing with sequence length) - see `Qwen4ExpTextPLELayer`/
+            # `Qwen4ExpTextNGramEmbedding` in the modeling code.
+            inputs_or_outputs[f"{cache_name_prefix}.ple_conv.{index}"] = {0: "batch_size"}
+            inputs_or_outputs[f"{cache_name_prefix}.ple_context.{index}"] = {0: "batch_size"}
+        if num_qsa_layers:
+            # Full accumulated position_ids, needed by the QSA indexer to recompute consistent
+            # RoPE for the whole cached key history - see the `past_key_values.position_ids`
+            # accumulation in `Qwen4ExpTextModel.forward`. Shape (batch_size, kv_len, 3); the
+            # last axis is the model's static multi-component position-id layout, so only dims
+            # 0 and 1 are dynamic here.
+            #
+            # Deliberately excluded from `make_stateful()` (see `patch_stateful_hybrid_ssm`/
+            # `stateful.py`) and kept as a regular external I/O pair instead: a CPU-plugin
+            # stateful `Assign` whose value passes through the dtype `Convert` + axis
+            # `Transpose` chain this tensor needs (int64<->float32 wire format, see
+            # `Qwen4ExpDummyPastKeyValuesGenerator`) fails at inference with an incompatible
+            # memory descriptor once the sequence axis grows, even though the declared shape is
+            # fully dynamic (confirmed via the structurally identical `indexer` cache, which has
+            # no such Convert/Transpose and works fine as a state). External I/O sidesteps this
+            # entirely (population handled by the calling wrapper - see `OVModelForQwen4Exp`).
+            inputs_or_outputs[f"{cache_name_prefix}.position_ids"] = {
+                0: "batch_size",
+                1: decoder_sequence_name,
+            }
 
 
 @register_in_tasks_manager(
@@ -7471,6 +7492,17 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
                 "qwen4_exp_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
             )
         if behavior == QwenVLConfigBehavior.LANGUAGE:
+            inputs_update = {"position_ids": {1: "batch_size", 2: "sequence_length"}}
+            if getattr(self._orig_config.text_config, "ple_layer_ids", None):
+                # `LMInputEmbedsConfigHelper` replaces `input_ids` with `inputs_embeds` for the
+                # VLM language-model export, so `Qwen4ExpTextModel.forward`'s own fallback
+                # (`reverse_embedding(inputs_embeds)`) would otherwise trace a lookup on the
+                # *merged* text+vision embeddings, producing garbage ids at image positions.
+                # Declaring `ple_input_ids` here makes `LMInputEmbedsConfigHelper` feed the real
+                # dummy `input_ids` through as a genuine traced input instead (it already has an
+                # `if "ple_input_ids" in self.inputs` branch ready for this), so PLE keeps
+                # seeing real token ids at every position.
+                inputs_update["ple_input_ids"] = {0: "batch_size", 1: "sequence_length"}
             language_config = get_vlm_text_generation_config(
                 "qwen4_exp_text",
                 self._orig_config.text_config,
@@ -7478,9 +7510,8 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
                 self.float_dtype,
                 model_patcher=Qwen4ExpModelPatcher,
                 dummy_input_generator=DummyQwen3_5LMInputGenerator,
-                inputs_update={"position_ids": {1: "batch_size", 2: "sequence_length"}},
+                inputs_update=inputs_update,
             )
-            language_config.orig_export_config.include_qsa_masks = False
             return language_config
         if behavior in (
             QwenVLConfigBehavior.VISION_EMBEDDINGS,

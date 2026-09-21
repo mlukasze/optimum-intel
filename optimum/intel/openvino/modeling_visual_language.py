@@ -7429,8 +7429,10 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
 
         self.num_grid_per_side = int(config.vision_config.num_position_embeddings**0.5)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
-        head_dim = config.vision_config.hidden_size // config.vision_config.num_heads
-        self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
+        # `Qwen3_5VisionRotaryEmbedding.__init__` takes the vision sub-config itself (it reads
+        # `config.rope_parameters` internally), not a raw head-dim int - matches how the stock
+        # `Qwen3_5VisionModel`/`Qwen4ExpVisionModel.__init__` construct it (`RotaryEmbedding(config)`).
+        self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(config.vision_config)
 
     def __setattr__(self, name, value):
         OVModelForVisualCausalLM.__setattr__(self, name, value)
@@ -7448,8 +7450,26 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        mm_token_type_ids=None,
+        is_first_iteration=False,
+        next_sequence_length=None,
         **kwargs,
     ):
+        # reconstruct cache_position as partially removed in v5.3 and totally removed in v5.5 -
+        # mirrors the sibling `prepare_inputs_for_generation` implementations above in this file.
+        if is_transformers_version(">=", "5.3") and (
+            cache_position is None or (not is_first_iteration and cache_position[0] == 0)
+        ):
+            if next_sequence_length is not None:
+                past_len = input_ids.shape[1] - next_sequence_length
+                cache_position = torch.arange(past_len, past_len + next_sequence_length, device=input_ids.device)
+            elif not is_first_iteration and attention_mask is not None:
+                # v5.3 decode step: input_ids is already sliced to 1 token, use attention_mask length
+                past_len = attention_mask.shape[1] - 1
+                cache_position = torch.tensor([past_len], device=input_ids.device)
+            else:
+                cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
         if past_key_values is not None:
             if inputs_embeds is not None and input_ids.shape[1] == 0:  # Exception 4
@@ -7480,11 +7500,16 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
                 "cache_position": cache_position,
+                # Since transformers v5.3, `get_rope_index` requires `mm_token_type_ids` (see the
+                # sibling `prepare_inputs_for_generation` implementations above in this file for
+                # the same pattern) - without listing it explicitly here, `generate()`'s
+                # `_validate_model_kwargs` rejects it before `forward()` is ever called, since that
+                # check only allows kwarg names that literally appear in this method's or
+                # `forward`'s signature (a bare `**kwargs` catch-all does not count).
+                "mm_token_type_ids": mm_token_type_ids,
             }
         )
         return model_inputs
-
-    # Adapted from Qwen3_5VisionModel.fast_pos_embed_interpolate
     # This method needs to be changed, as instead of running self.pos_embed of type nn.Embedding, openvino model needs to be inferred (self.vision_embeddings_pos)
     def fast_pos_embed_interpolate(self, grid_thw):
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
@@ -7778,6 +7803,19 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
 
         return super().generate(*args, **kwargs)
 
+    def get_experts_implementation(self):
+        # transformers>=5.15 `generate` queries the experts implementation to decide
+        # on a decode-time MoE kernel swap; that swap is a no-op on CPU (OpenVINO),
+        # since the MoE kernel is baked into the exported graph. Matches the identical
+        # stub already present on the sibling `_OVMuseGlimmerForCausalLM` class - OV
+        # wrapper classes don't inherit from `PreTrainedModel`, so this generic method
+        # is otherwise missing entirely.
+        return "openvino_impl"
+
+    def set_experts_implementation(self, experts_implementation):
+        # No-op: the MoE kernel is baked into the exported OpenVINO graph.
+        return
+
 
 if is_transformers_version(">=", "5.2"):
     # getattr(..., None): tolerate upstream renames/removals of these helper methods across transformers versions
@@ -7792,8 +7830,59 @@ if is_transformers_version(">=", "5.16"):
         Qwen4ExpVisionRotaryEmbedding,
     )
 
+    # For the VLM `language_model` sub-component, mirroring `OVModelForQwen4Exp` in
+    # `modeling_decoder.py` (the text-only counterpart): the generic `OVModelWithEmbedForCausalLM`
+    # base class has no notion of the QSA indexer's externally-kept, full accumulated
+    # `cache_params.*.position_ids` (batch, kv_len, 3) history, so left unfed the OV input tensor
+    # keeps its default empty allocation, breaking the indexer's `Concat` once real tokens flow in.
+    QSA_POSITION_IDS_INPUT = "cache_params.past.position_ids"
+    QSA_POSITION_IDS_OUTPUT = "cache_params.present.position_ids"
+
+    class OVModelWithEmbedForQwen4ExpCausalLM(OVModelWithEmbedForCausalLM):
+        def prepare_inputs(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+            ple_input_ids = kwargs.pop("ple_input_ids", None)
+            inputs = super().prepare_inputs(
+                input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
+            )
+
+            if "ple_input_ids" in self.input_names:
+                # The generic base class's `prepare_inputs` has no notion of this Qwen4Exp-only
+                # input (unlike `input_ids`/`inputs_embeds`, it is only ever meant for the PLE
+                # n-gram-embedding lookup - see the `inputs_update["ple_input_ids"]` comment in
+                # `Qwen4ExpOpenVINOConfig.with_behavior` for why the export needs it explicit).
+                if ple_input_ids is None:
+                    raise ValueError("Expected 'ple_input_ids', but it was not passed")
+                inputs["ple_input_ids"] = ple_input_ids
+
+            if not getattr(self, "_has_qsa_position_ids", False):
+                return inputs
+
+            if past_key_values is None:
+                # First call of a new sequence - mirrors the internal `reset_state()` the base
+                # class already does for the real OV-state cache tensors. `input_ids` is `None`
+                # for VLM calls once `inputs_embeds` has already been computed upstream (image +
+                # text embeddings merged) - fall back to it for the batch size, same as the base
+                # class's own `prepare_inputs` does a few lines above.
+                batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+                self._qsa_position_ids_cache = np.zeros((batch_size, 0, 3), dtype=np.float32)
+
+            inputs[QSA_POSITION_IDS_INPUT] = self._qsa_position_ids_cache
+            return inputs
+
+        def forward(self, *args, **kwargs):
+            outputs = super().forward(*args, **kwargs)
+            if getattr(self, "_has_qsa_position_ids", False):
+                self._qsa_position_ids_cache = self.request.get_tensor(QSA_POSITION_IDS_OUTPUT).data.copy()
+            return outputs
+
     class _OVQwen4ExpForCausalLM(_OVQwen3_5ForCausalLM):
-        pass
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Re-target the already-constructed `language_model`'s class - avoids editing the
+            # shared `OVModelForVisualCausalLM.__init__` used by every VLM architecture.
+            self.language_model.__class__ = OVModelWithEmbedForQwen4ExpCausalLM
+            self.language_model._has_qsa_position_ids = QSA_POSITION_IDS_INPUT in self.language_model.input_names
+            self.language_model._qsa_position_ids_cache = None  # np.float32, shape (batch, kv_len, 3)
 
     def _qwen4_exp_rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -7805,9 +7894,16 @@ if is_transformers_version(">=", "5.16"):
             wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge).permute(0, 2, 1, 3).flatten()
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(torch.arange(max_grid_size, device=grid_thw.device))
-        return rotary_pos_emb_full[pos_ids].flatten(1)
+        # `Qwen4ExpVisionRotaryEmbedding.forward(x, position_ids)` computes `(cos, sin)` directly
+        # per-token; it no longer exposes the older "build a full table over
+        # `arange(max_grid_size)`, then index per-token" API this function originally used. The
+        # already-traced vision-embeddings-merger IR still expects that older contract: a raw,
+        # per-token, un-doubled `(N, head_dim // 2)` frequency tensor, which it doubles and
+        # cos/sins itself. So reproduce just the frequency computation (`position_ids *
+        # inv_freq`) plus h/w concatenation here directly (reshape/concat only, no cos/sin yet -
+        # exact), keeping the already-exported merger IR fed with the shape it was traced with.
+        freqs = pos_ids[..., None].float() * self.rotary_pos_emb.inv_freq.float()
+        return torch.cat([freqs[:, 0], freqs[:, 1]], dim=-1)
 
     def _qwen4_exp_get_rope_index(
         self, input_ids, image_grid_thw=None, video_grid_thw=None, attention_mask=None, mm_token_type_ids=None, **kwargs
